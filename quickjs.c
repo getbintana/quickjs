@@ -381,6 +381,8 @@ struct JSRuntime {
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
+    /* Bintana patch: see JS_SetArithHandler in quickjs.h. */
+    JSArithHandler *arith_handler;
 
     JSPromiseHook *promise_hook;
     void *promise_hook_opaque;
@@ -2472,6 +2474,12 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
     rt->interrupt_handler = cb;
     rt->interrupt_opaque = opaque;
+}
+
+/* Bintana patch: see quickjs.h. */
+void JS_SetArithHandler(JSRuntime *rt, JSArithHandler *handler)
+{
+    rt->arith_handler = handler;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
@@ -15183,6 +15191,35 @@ int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val)
     return JS_ToBigInt64Free(ctx, (int64_t *)pres, js_dup(val));
 }
 
+/*
+ * Bintana patch: an embedder's own class answers an operator first.
+ *
+ * One place that knows both numberings, so the four call sites are a line each
+ * and the enum an embedder sees never depends on quickjs's opcode order.  See
+ * JS_SetArithHandler in quickjs.h.
+ */
+static int js_arith_hook(JSContext *ctx, JSValue *sp, OPCodeEnum op)
+{
+    static const struct { OPCodeEnum from; JSArithOp to; } map[] = {
+        { OP_add, JS_ARITH_ADD }, { OP_sub,  JS_ARITH_SUB },
+        { OP_mul, JS_ARITH_MUL }, { OP_div,  JS_ARITH_DIV },
+        { OP_mod, JS_ARITH_MOD }, { OP_pow,  JS_ARITH_POW },
+        { OP_neg, JS_ARITH_NEG }, { OP_plus, JS_ARITH_POS },
+        { OP_inc, JS_ARITH_INC }, { OP_dec,  JS_ARITH_DEC },
+        { OP_lt,  JS_ARITH_LT },  { OP_lte,  JS_ARITH_LTE },
+        { OP_gt,  JS_ARITH_GT },  { OP_gte,  JS_ARITH_GTE },
+    };
+
+    if (!ctx->rt->arith_handler)
+        return JS_ARITH_OTHER;
+
+    for (size_t i = 0; i < countof(map); i++)
+        if (map[i].from == op)
+            return ctx->rt->arith_handler(ctx, sp, map[i].to);
+
+    return JS_ARITH_OTHER;
+}
+
 static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
                                                      JSValue *sp,
                                                      OPCodeEnum op)
@@ -15197,6 +15234,14 @@ static no_inline __exception int js_unary_arith_slow(JSContext *ctx,
     /* fast path for float64 */
     if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)))
         goto handle_float64;
+
+    /* Bintana patch: see js_arith_hook. */
+    if (JS_VALUE_GET_TAG(op1) == JS_TAG_OBJECT) {
+        int r = js_arith_hook(ctx, sp, op);
+        if (r != JS_ARITH_OTHER)
+            return r;
+    }
+
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1))
         goto exception;
@@ -15430,6 +15475,13 @@ static no_inline __exception int js_binary_arith_slow(JSContext *ctx, JSValue *s
         }
         return 0;
     }
+    /* Bintana patch: see js_arith_hook. */
+    if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
+        int r = js_arith_hook(ctx, sp, op);
+        if (r != JS_ARITH_OTHER)
+            return r;
+    }
+
     op1 = JS_ToNumericFree(ctx, op1);
     if (JS_IsException(op1)) {
         JS_FreeValue(ctx, op2);
@@ -15598,6 +15650,13 @@ static no_inline __exception int js_add_slow(JSContext *ctx, JSValue *sp)
             sp[-2] = JS_MKPTR(JS_TAG_BIG_INT, r);
         }
         return 0;
+    }
+
+    /* Bintana patch: see js_arith_hook. */
+    if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
+        int r = js_arith_hook(ctx, sp, OP_add);
+        if (r != JS_ARITH_OTHER)
+            return r;
     }
 
     if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
@@ -15952,6 +16011,13 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
     op2 = sp[-1];
     tag1 = JS_VALUE_GET_NORM_TAG(op1);
     tag2 = JS_VALUE_GET_NORM_TAG(op2);
+
+    /* Bintana patch: see js_arith_hook. */
+    if (tag1 == JS_TAG_OBJECT || tag2 == JS_TAG_OBJECT) {
+        int r = js_arith_hook(ctx, sp, op);
+        if (r != JS_ARITH_OTHER)
+            return r;
+    }
 
     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NUMBER);
     if (JS_IsException(op1)) {

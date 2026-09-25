@@ -555,6 +555,46 @@ JS_EXTERN int JS_AddIntrinsicMapSet(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicTypedArrays(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicPromise(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicBigInt(JSContext *ctx);
+
+/* Bintana patch: arithmetic and comparison on an embedder's own class.
+ *
+ * quickjs-ng removed the operator overloading and the BigDecimal that Bellard's
+ * quickjs carried, so a language built on it has no way to make `a * b` mean
+ * anything on a value of its own -- which for an exact decimal is not a
+ * convenience but the whole point.  This is the smallest hole that fixes it: one
+ * callback, consulted by the arithmetic slow paths *before* they reach
+ * ToPrimitive, so an embedder's class can answer for itself and everything else
+ * behaves exactly as before.
+ *
+ * `op` says which operator, as this enum and **not** as the interpreter's own
+ * opcode: the numbering of those is quickjs's business and would tie an embedder
+ * to it.  The handler is handed the stack pointer the opcode is working on -- a
+ * binary operator has its operands at sp[-2] and sp[-1] and writes its result to
+ * sp[-2], a unary one is at sp[-1] -- and owns them either way: answering DONE
+ * means it freed them and left a result behind.
+ *
+ * It answers:
+ *    JS_ARITH_DONE   handled; the operands were consumed and the result written
+ *    JS_ARITH_ERROR  an exception was raised
+ *    JS_ARITH_OTHER  not one of mine -- carry on as if this hook did not exist
+ *
+ * Strict equality is deliberately absent: `===` on two objects is identity, it
+ * has no slow path to hook, and giving it one would change what identity means
+ * for every object in the program.
+ */
+typedef enum {
+    JS_ARITH_ADD, JS_ARITH_SUB, JS_ARITH_MUL, JS_ARITH_DIV, JS_ARITH_MOD,
+    JS_ARITH_POW, JS_ARITH_NEG, JS_ARITH_POS, JS_ARITH_INC, JS_ARITH_DEC,
+    JS_ARITH_LT,  JS_ARITH_LTE, JS_ARITH_GT,  JS_ARITH_GTE,
+} JSArithOp;
+
+#define JS_ARITH_DONE   0
+#define JS_ARITH_ERROR  (-1)
+#define JS_ARITH_OTHER  1
+
+typedef int JSArithHandler(JSContext *ctx, JSValue *sp, JSArithOp op);
+JS_EXTERN void JS_SetArithHandler(JSRuntime *rt, JSArithHandler *handler);
+
 JS_EXTERN int JS_AddIntrinsicWeakRef(JSContext *ctx);
 JS_EXTERN int JS_AddPerformance(JSContext *ctx);
 JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);

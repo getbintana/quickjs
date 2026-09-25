@@ -23762,7 +23762,20 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    /* Bintana patch: js_atod, not strtod.
+     *
+     * `strtod` reads the decimal separator of the C locale, and GTK calls
+     * setlocale(LC_ALL, "") at startup -- so in every locale that writes a
+     * decimal comma (es, de, fr, pt, ru...) `JSON.parse("0.05")` stopped at the
+     * dot and answered 0. Silently: every fraction in a .form, in a settings
+     * file, in any data an application parsed. `js_atod` is QuickJS's own
+     * conversion, which every other number path here already uses. */
+    {
+        JSATODTempMem atod_mem;
+
+        s->token.u.num.val =
+            js_float64(js_atod((const char *)p_start, NULL, 10, 0, &atod_mem));
+    }
     *pp = p;
     return 0;
 }

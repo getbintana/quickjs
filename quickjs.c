@@ -380,6 +380,10 @@ struct JSRuntime {
     struct JSStackFrame *current_stack_frame;
 
     JSInterruptHandler *interrupt_handler;
+    /* Bintana patch: see JS_SetDebugHandler in quickjs.h. */
+    JSDebugHandler *debug_handler;
+    void *debug_opaque;
+    bool debug_on_throw;
     void *interrupt_opaque;
     /* Bintana patch: see JS_SetArithHandler in quickjs.h. */
     JSArithHandler *arith_handler;
@@ -434,6 +438,17 @@ typedef struct JSStackFrame {
     struct JSVarRef **var_refs; /* references to arguments or local variables */
     uint8_t *cur_pc; /* only used in bytecode functions : PC of the
                         instruction after the call */
+    /* Bintana patch: `this` is a parameter of the call and had no slot on the
+       frame, so a debugger could read every local of a method and not the one
+       name its body uses most. Borrowed like `cur_func`: the caller holds it
+       for the length of the call, so it is neither duplicated nor marked. */
+    JSValue this_obj;
+    /* Bintana patch: the last line a debugger was told about **in this frame**.
+       One line is many opcodes, so something has to say when the program left
+       it -- and a single global "last line" cannot: returning from a call lands
+       back on the line that made it, which would stop twice. The memory belongs
+       to the frame because the question does. Zero until asked. */
+    int debug_line;
     uint16_t var_ref_count; /* number of var refs */
     uint16_t arg_count;
     bool is_strict_mode;
@@ -6635,6 +6650,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_obj = unsafe_unconst(this_val);   /* Bintana patch */
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
@@ -6761,6 +6777,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_obj = unsafe_unconst(this_val);   /* Bintana patch */
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
     rt->current_stack_frame = sf->prev_frame;
@@ -8401,6 +8418,562 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     JS_FreeValue(ctx, error_obj);
     rt->in_build_stack_trace = false;
+
+    /*
+     * Bintana patch: a debugger may want to stop where a throw *happened*,
+     * which is here and not where it is caught -- by then the frames that built
+     * it are gone and so are their values.
+     *
+     * Called after the flag is down, so the handler is free to build a
+     * backtrace of its own; `pc` is NULL, which is how it tells this apart from
+     * the ordinary per-opcode call.
+     */
+    if (rt->debug_on_throw && rt->debug_handler)
+        rt->debug_handler(ctx, NULL, rt->debug_opaque);
+}
+
+
+/*
+ * Bintana patch: what a debugger needs, which the frames already held.
+ *
+ * Everything here reads structures QuickJS keeps for its own backtraces --
+ * `JSStackFrame` has every frame's arguments and locals, `JSFunctionBytecode`
+ * has their names and the pc2line table -- and hands the answers back as
+ * ordinary JS values, so an embedder frees them with `JS_FreeValue` and needs
+ * no view of a type declared in this file.  Written beside `build_backtrace`
+ * because it borrows the same three statics: `find_line_num`, `get_func_name`
+ * and `js_class_has_bytecode`.
+ *
+ * `pc` is passed in rather than read off the frame: `sf->cur_pc` is only
+ * written when a frame calls out, so the frame that is *running* has a stale
+ * one.  The interpreter hands the debug handler the pc it is about to execute,
+ * and that is the only place the top frame's position exists.
+ *
+ * See JS_SetDebugHandler in quickjs.h, and runtime/src/bta_debug.c.
+ */
+
+/* The bytecode of a frame's function, or NULL for a native one. */
+static JSFunctionBytecode *bta_frame_bytecode(JSStackFrame *sf)
+{
+    JSObject *p;
+
+    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return NULL;
+
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id))
+        return NULL;
+
+    return p->u.func.function_bytecode;
+}
+
+/*
+ * Where frame 0 is.
+ *
+ * The topmost frame that is running *code*, which is not always the topmost
+ * frame: a throw is reported from inside `Error`'s own constructor, and a
+ * native frame has no line, no locals and nothing a debugger can say about it.
+ * Skipping them here rather than at each caller is what keeps one numbering --
+ * `JS_DebugBacktrace` counts from the same place `JS_DebugLocals` and
+ * `JS_DebugEval` index into, so `frame: 1` means the same frame in all three.
+ *
+ * Only at the top. A native frame *between* two JavaScript ones is a real part
+ * of the stack -- a callback called from C -- and is reported as `(native)`.
+ */
+static JSStackFrame *bta_frame_first(JSRuntime *rt)
+{
+    JSStackFrame *sf = rt->current_stack_frame;
+
+    while (sf && !bta_frame_bytecode(sf))
+        sf = sf->prev_frame;
+
+    return sf;
+}
+
+/* The frame `index` steps up from the first one running code, or NULL. */
+static JSStackFrame *bta_frame_at(JSRuntime *rt, int index)
+{
+    JSStackFrame *sf = bta_frame_first(rt);
+
+    while (sf && index > 0) {
+        sf = sf->prev_frame;
+        index--;
+    }
+    return sf;
+}
+
+/*
+ * The running frame's file and line, and nothing else built.
+ *
+ * This is what runs per opcode while a breakpoint is armed, so it allocates
+ * nothing and returns the filename as an atom: comparing atoms is comparing
+ * integers, and the caller only needs a string once it has decided to stop.
+ */
+bool JS_DebugPosition(JSContext *ctx, const uint8_t *pc, JSAtom *file, int *line)
+{
+    JSStackFrame       *sf = ctx->rt->current_stack_frame;
+    JSFunctionBytecode *b  = bta_frame_bytecode(sf);
+    int                 column;
+    int                 at;
+
+    if (!b || !pc)
+        return false;
+
+    at = find_line_num(ctx, b, (uint32_t)(pc - b->byte_code_buf), &column);
+    if (at == -1 || at == sf->debug_line)
+        return false;               /* the same line as the opcode before it */
+
+    sf->debug_line = at;
+    *file = b->filename;
+    *line = at;
+    return true;
+}
+
+/*
+ * Every line of a compiled function that has an opcode of its own, and of every
+ * function nested inside it -- which is what a debugger has to know before it
+ * can honour "put a breakpoint on line 9".
+ *
+ * It exists because the answer is not "every line with code on it": QuickJS
+ * emits a pc2line entry where the line *changes*, so two statements the
+ * compiler runs together share one, and `let total = 0;` under
+ * `function Main() {` never gets a line of its own. A breakpoint there would
+ * arm and never fire, silently, which is the failure a debugger cannot have.
+ * With this the caller moves it to the next line that exists, the way every
+ * editor does.
+ *
+ * The walk is `find_line_num`'s decoder without the search, and the recursion
+ * is over `cpool`, where a function's nested functions live.
+ */
+static void bta_lines_of(JSContext *ctx, JSValueConst func, JSValue out,
+                         uint32_t *n, JSAtom want)
+{
+    JSObject           *p;
+    JSFunctionBytecode *b;
+    const uint8_t      *pp, *p_end;
+    int                 line_num, v, ret;
+    unsigned int        op;
+    int                 i;
+
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_FUNCTION_BYTECODE &&
+        JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return;
+
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_FUNCTION_BYTECODE) {
+        b = JS_VALUE_GET_PTR(func);
+    } else {
+        p = JS_VALUE_GET_OBJ(func);
+        if (!js_class_has_bytecode(p->class_id))
+            return;
+        b = p->u.func.function_bytecode;
+    }
+    if (!b || (want != JS_ATOM_NULL && b->filename != want))
+        return;
+
+    /* The function's own first line, which is where its prologue runs. */
+    JS_SetPropertyUint32(ctx, out, (*n)++, JS_NewInt32(ctx, b->line_num));
+
+    pp = b->pc2line_buf;
+    if (pp) {
+        p_end    = pp + b->pc2line_len;
+        line_num = b->line_num;
+        while (pp < p_end) {
+            op = *pp++;
+            if (op == 0) {
+                uint32_t val;
+                ret = get_leb128(&val, pp, p_end);
+                if (ret < 0)
+                    break;
+                pp += ret;
+                ret = get_sleb128(&v, pp, p_end);
+                if (ret < 0)
+                    break;
+                pp += ret;
+                line_num += v;
+            } else {
+                op -= PC2LINE_OP_FIRST;
+                line_num += (op % PC2LINE_RANGE) + PC2LINE_BASE;
+            }
+            /* the column delta, read and dropped */
+            ret = get_sleb128(&v, pp, p_end);
+            if (ret < 0)
+                break;
+            pp += ret;
+            JS_SetPropertyUint32(ctx, out, (*n)++, JS_NewInt32(ctx, line_num));
+        }
+    }
+
+    for (i = 0; i < b->cpool_count; i++)
+        bta_lines_of(ctx, b->cpool[i], out, n, want);
+}
+
+JSValue JS_DebugLines(JSContext *ctx, JSValueConst compiled)
+{
+    JSValue  out = JS_NewArray(ctx);
+    uint32_t n = 0;
+
+    if (JS_IsException(out))
+        return out;
+
+    bta_lines_of(ctx, compiled, out, &n, JS_ATOM_NULL);
+    return out;
+}
+
+int JS_DebugDepth(JSRuntime *rt)
+{
+    JSStackFrame *sf;
+    int           n = 0;
+
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame)
+        n++;
+
+    return n;
+}
+
+/*
+ * The stack as `[{ Name, File, Line, Column }]`, innermost first.
+ *
+ * A native frame keeps its name and has no place, which is the same thing a
+ * traceback prints as `(native)` -- reporting it rather than skipping it is
+ * what makes the frame numbering here the same one `JS_DebugLocals` counts.
+ */
+JSValue JS_DebugBacktrace(JSContext *ctx, const uint8_t *pc)
+{
+    JSRuntime    *rt = ctx->rt;
+    JSStackFrame *sf;
+    JSValue       out = JS_NewArray(ctx);
+    uint32_t      i = 0;
+
+    if (JS_IsException(out))
+        return out;
+
+    for (sf = bta_frame_first(rt); sf != NULL; sf = sf->prev_frame, i++) {
+        JSFunctionBytecode *b = bta_frame_bytecode(sf);
+        JSValue             frame = JS_NewObject(ctx);
+        const char         *name = get_func_name(ctx, sf->cur_func);
+
+        JS_SetPropertyStr(ctx, frame, "Name",
+                          JS_NewString(ctx, name && *name ? name : "<anonymous>"));
+        JS_FreeCString(ctx, name);
+
+        /* The running frame's position is the pc handed in; every frame above
+           it was interrupted at a call and wrote `cur_pc` on the way out.
+           With no pc at all -- which is what a throw hands in -- even the
+           running frame has to fall back on `cur_pc`, and that one points past
+           the instruction rather than at it. */
+        bool           own = (i == 0 && pc != NULL);
+        const uint8_t *at  = own ? pc : sf->cur_pc;
+
+        if (b && at) {
+            int      line, column;
+            uint32_t off = (uint32_t)(at - b->byte_code_buf) - (own ? 0 : 1);
+            const char *file;
+
+            line = find_line_num(ctx, b, off, &column);
+            file = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
+
+            JS_SetPropertyStr(ctx, frame, "File",
+                              JS_NewString(ctx, file ? file : ""));
+            JS_FreeCString(ctx, file);
+            JS_SetPropertyStr(ctx, frame, "Line", JS_NewInt32(ctx, line));
+            JS_SetPropertyStr(ctx, frame, "Column", JS_NewInt32(ctx, column));
+        } else {
+            JS_SetPropertyStr(ctx, frame, "File", JS_NewString(ctx, ""));
+            JS_SetPropertyStr(ctx, frame, "Line", JS_NewInt32(ctx, 0));
+            JS_SetPropertyStr(ctx, frame, "Column", JS_NewInt32(ctx, 0));
+        }
+        JS_SetPropertyUint32(ctx, out, i, frame);
+    }
+    return out;
+}
+
+/*
+ * One frame's arguments and locals, as `[{ Name, Value }]`, in the order the
+ * function declares them -- `vardefs` is the arguments followed by the
+ * variables, which is the order somebody reading the source meets them.
+ *
+ * A captured variable lives in a `JSVarRef` rather than in the frame's slot, so
+ * it is read through `var_refs`; that is the same indirection the interpreter
+ * itself uses for a closure's variable and the reason a local that some nested
+ * function closes over reads as undefined without it.
+ *
+ * `this` is not among them and is added last, because it is the one name a
+ * method body uses most and the one `vardefs` never carries.
+ */
+JSValue JS_DebugLocals(JSContext *ctx, int index)
+{
+    JSStackFrame       *sf = bta_frame_at(ctx->rt, index);
+    JSFunctionBytecode *b  = bta_frame_bytecode(sf);
+    JSValue             out = JS_NewArray(ctx);
+    uint32_t            n = 0;
+    int                 i;
+
+    if (JS_IsException(out) || !b || !b->vardefs)
+        return out;
+
+    for (i = 0; i < b->arg_count + b->var_count; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        JSValue   value;
+        JSValue   row;
+        const char *name;
+
+        if (vd->var_name == JS_ATOM_NULL)
+            continue;
+
+        if (i < b->arg_count) {
+            value = sf->arg_buf[i];
+        } else {
+            int v = i - b->arg_count;
+            if (vd->is_captured && sf->var_refs && sf->var_refs[vd->var_ref_idx])
+                value = *sf->var_refs[vd->var_ref_idx]->pvalue;
+            else
+                value = sf->var_buf[v];
+        }
+
+        /* A `let` before its declaration is reached holds the hole, and
+           showing it as anything but absent would be a lie about the program. */
+        if (JS_VALUE_GET_TAG(value) == JS_TAG_UNINITIALIZED)
+            continue;
+
+        row  = JS_NewObject(ctx);
+        name = JS_AtomToCString(ctx, vd->var_name);
+        JS_SetPropertyStr(ctx, row, "Name", JS_NewString(ctx, name ? name : "?"));
+        JS_FreeCString(ctx, name);
+        JS_SetPropertyStr(ctx, row, "Value", js_dup(value));
+        JS_SetPropertyStr(ctx, row, "Argument", JS_NewBool(ctx, i < b->arg_count));
+        JS_SetPropertyUint32(ctx, out, n++, row);
+    }
+
+    {
+        JSValue row = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, row, "Name", JS_NewString(ctx, "this"));
+        JS_SetPropertyStr(ctx, row, "Value", js_dup(sf->this_obj));
+        JS_SetPropertyStr(ctx, row, "Argument", JS_FALSE);
+        JS_SetPropertyUint32(ctx, out, n++, row);
+    }
+    return out;
+}
+
+/*
+ * An expression, evaluated where the program is standing.
+ *
+ * A *direct* eval is the one that sees the enclosing scope, and QuickJS builds
+ * it from `rt->current_stack_frame` -- so evaluating in a frame is pointing
+ * that at the frame and putting it back. Nothing else runs while this is
+ * called: the debugger holds the interpreter, which is what makes moving it
+ * safe.
+ *
+ * **The scope index is -1, which means the function's scope and not the block's.**
+ * The compiler writes the exact lexical scope into each `OP_eval` and there is
+ * no such number for an arbitrary pc, so a `let` declared inside an `if` in the
+ * middle of a function is not visible here while an argument, a `var` and a
+ * `let` of the function body are. Answering something for the common case beats
+ * answering nothing for all of them, and the limit is written down where a
+ * caller will meet it.
+ *
+ * The result is the expression's value, or an exception -- which is the
+ * caller's to catch and report, since a debugger asking a question must never
+ * leave one behind for the program to find.
+ */
+JSValue JS_DebugEval(JSContext *ctx, int index, const char *expr)
+{
+    JSStackFrame       *sf = bta_frame_at(ctx->rt, index);
+    JSFunctionBytecode *b  = bta_frame_bytecode(sf);
+    DynBuf              src;
+    JSValue             fn, out, *argv;
+    int                 i, n = 0;
+    JSAtom             *seen;
+
+    if (!b)
+        return JS_ThrowTypeError(ctx, "no frame %d to evaluate in", index);
+
+    /*
+     * The frame's own names, **passed in as parameters**.
+     *
+     * The obvious way is a *direct* eval, which is the one that sees an
+     * enclosing scope -- and it was the first way this worked. It reaches
+     * arguments and `var`s and stops there: QuickJS compiles a direct eval
+     * against a lexical scope index the compiler wrote into each `OP_eval`, and
+     * there is no such number for an arbitrary pc, so with none of them a
+     * `let` or a `const` is simply not in scope. In a language where almost
+     * everything is `let`, an immediate window that could read `a + b` and not
+     * `total` is not one.
+     *
+     * So the expression is wrapped in a function of the frame's own names and
+     * called with the frame's own values. What it can name is then **exactly
+     * what `JS_DebugLocals` shows**, which is the property worth having: the
+     * panel and the box agree by construction. `this` is the call's `this`
+     * rather than a parameter, so `this.Ok.Text` reads as it does in the code.
+     *
+     * Shadowing is why the names are de-duplicated last-wins: two `let i` in
+     * nested blocks are two vardefs with one name, and a function cannot take
+     * the same parameter twice under strict mode.
+     */
+    js_dbuf_init(ctx, &src);
+    dbuf_putstr(&src, "(function(");
+
+    seen = js_malloc(ctx, sizeof(*seen) * (b->arg_count + b->var_count + 1));
+    if (!seen) {
+        dbuf_free(&src);
+        return JS_EXCEPTION;
+    }
+
+    for (i = 0; i < b->arg_count + b->var_count; i++) {
+        JSVarDef   *vd = &b->vardefs[i];
+        const char *name;
+        int         k;
+        bool        dup = false;
+
+        if (vd->var_name == JS_ATOM_NULL)
+            continue;
+        for (k = 0; k < n; k++)
+            if (seen[k] == vd->var_name) {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
+
+        name = JS_AtomToCString(ctx, vd->var_name);
+        if (!name)
+            continue;
+        /* `arguments` and the like are real names but not ones a parameter
+           list will take; anything that is not an identifier is skipped. */
+        if (n)
+            dbuf_putc(&src, ',');
+        dbuf_putstr(&src, name);
+        JS_FreeCString(ctx, name);
+        seen[n++] = vd->var_name;
+    }
+
+    dbuf_putstr(&src, "){return (");
+    dbuf_putstr(&src, expr);
+    dbuf_putstr(&src, ");})");
+    dbuf_putc(&src, '\0');
+
+    fn = JS_Eval(ctx, (char *)src.buf, src.size - 1, "<debug>",
+                 JS_EVAL_TYPE_GLOBAL);
+    dbuf_free(&src);
+
+    if (JS_IsException(fn)) {
+        js_free(ctx, seen);
+        return fn;
+    }
+
+    argv = js_malloc(ctx, sizeof(*argv) * (n > 0 ? n : 1));
+    if (!argv) {
+        js_free(ctx, seen);
+        JS_FreeValue(ctx, fn);
+        return JS_EXCEPTION;
+    }
+
+    /* The values, in the order the parameters were written. */
+    n = 0;
+    for (i = 0; i < b->arg_count + b->var_count; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        JSValue   v;
+        int       k;
+        bool      dup = false;
+
+        if (vd->var_name == JS_ATOM_NULL)
+            continue;
+        for (k = 0; k < n; k++)
+            if (seen[k] == vd->var_name) {
+                dup = true;
+                break;
+            }
+        if (dup)
+            continue;
+
+        if (i < b->arg_count)
+            v = sf->arg_buf[i];
+        else if (vd->is_captured && sf->var_refs && sf->var_refs[vd->var_ref_idx])
+            v = *sf->var_refs[vd->var_ref_idx]->pvalue;
+        else
+            v = sf->var_buf[i - b->arg_count];
+
+        /* A `let` before its declaration holds the hole, which cannot be
+           passed anywhere: undefined is what naming it should answer. */
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED)
+            v = JS_UNDEFINED;
+
+        argv[n] = js_dup(v);
+        seen[n] = vd->var_name;
+        n++;
+    }
+
+    out = JS_Call(ctx, fn, sf->this_obj, n, vc(argv));
+
+    for (i = 0; i < n; i++)
+        JS_FreeValue(ctx, argv[i]);
+    js_free(ctx, argv);
+    js_free(ctx, seen);
+    JS_FreeValue(ctx, fn);
+    return out;
+}
+
+/*
+ * Writing a local back, by name.
+ *
+ * The slots are the frame's own -- `arg_buf` for an argument, `var_buf` for a
+ * variable, and the `JSVarRef` when something nested closed over it, which is
+ * the same indirection `JS_DebugLocals` reads through. A name that is not there
+ * answers false rather than throwing: which names exist is a question the
+ * caller has already asked.
+ */
+bool JS_DebugSetLocal(JSContext *ctx, int index, const char *name, JSValue value)
+{
+    JSStackFrame       *sf = bta_frame_at(ctx->rt, index);
+    JSFunctionBytecode *b  = bta_frame_bytecode(sf);
+    JSAtom              want;
+    int                 i;
+    bool                done = false;
+
+    /* Bintana patch: the value is the callee's on every road, this one too --
+     * a frame with no locals returned with it unreleased, and JS_FreeRuntime
+     * then aborted on the object it left alive. */
+    if (!b || !b->vardefs) {
+        JS_FreeValue(ctx, value);
+        return false;
+    }
+
+    want = JS_NewAtom(ctx, name);
+    for (i = 0; i < b->arg_count + b->var_count; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        JSValue  *at;
+
+        if (vd->var_name != want)
+            continue;
+
+        if (i < b->arg_count) {
+            at = &sf->arg_buf[i];
+        } else if (vd->is_captured && sf->var_refs && sf->var_refs[vd->var_ref_idx]) {
+            at = sf->var_refs[vd->var_ref_idx]->pvalue;
+        } else {
+            at = &sf->var_buf[i - b->arg_count];
+        }
+
+        JS_FreeValue(ctx, *at);
+        *at  = value;
+        done = true;
+        break;
+    }
+    JS_FreeAtom(ctx, want);
+
+    if (!done)
+        JS_FreeValue(ctx, value);
+    return done;
+}
+
+void JS_SetDebugHandler(JSRuntime *rt, JSDebugHandler *cb, void *opaque)
+{
+    rt->debug_handler = cb;
+    rt->debug_opaque  = opaque;
+}
+
+void JS_DebugStopOnThrow(JSRuntime *rt, bool on)
+{
+    rt->debug_on_throw = on;
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -17959,6 +18532,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_obj = unsafe_unconst(this_obj);   /* Bintana patch */
     sf->arg_count = argc;
     arg_buf = argv;
 
@@ -18144,8 +18718,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
+/* Bintana patch: the debugger looks before every opcode.  With none installed
+   this is one predictable branch on a field already in cache; what it costs when
+   nothing is attached is measured in docs/plans/debug-plan.md. */
+#define BTA_DEBUG_STEP(pc) \
+    if (unlikely(rt->debug_handler)) rt->debug_handler(ctx, pc, rt->debug_opaque);
+
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) BTA_DEBUG_STEP(pc) switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -18156,7 +18736,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ BTA_DEBUG_STEP(pc) goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -18220,6 +18800,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     arg_buf = (JSValue *)argv;
     sf->arg_count = argc;
     sf->cur_func = unsafe_unconst(func_obj);
+    sf->this_obj = unsafe_unconst(this_obj);   /* Bintana patch */
+    sf->debug_line = 0;                        /* Bintana patch */
     var_refs = p->u.func.var_refs;
 
     local_buf = alloca(alloca_size);

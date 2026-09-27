@@ -674,8 +674,16 @@ typedef enum {
     JS_SYMBOL_METHOD,
     JS_SYMBOL_FUNCTION,
 } JSSymbolKind;
+/* `supertype` is the name in an `extends` clause and is empty for everything
+ * except a class, for a class that declares no `extends`, and for a class whose
+ * `extends` is not a plain identifier.  That last one is the whole limit and it
+ * is deliberate: recovering a name from a general expression would mean reading
+ * emitted bytecode back, and the answer a class's base class is wanted from is
+ * `Base` or `ns.Base` in every declaration that matters -- an editor asking
+ * "what does this class have" needs the chain, not the expression. */
 typedef void JSSymbolHandler(void *opaque, JSSymbolKind kind,
-                             const char *name, const char *parent, int line);
+                             const char *name, const char *parent,
+                             const char *supertype, int line);
 JS_EXTERN void JS_SetSymbolHandler(JSRuntime *rt, JSSymbolHandler *cb,
                                    void *opaque);
 

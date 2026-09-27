@@ -25904,10 +25904,11 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
  * in quickjs.h.
  */
 static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
-                             JSAtom name, JSAtom parent, int line)
+                             JSAtom name, JSAtom parent, JSAtom supertype,
+                             int line)
 {
     JSRuntime  *rt = s->ctx->rt;
-    const char *cname, *cparent;
+    const char *cname, *cparent, *csuper;
 
     if (!rt->symbol_handler || name == JS_ATOM_NULL)
         return;
@@ -25921,10 +25922,19 @@ static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
         ? JS_AtomToCString(s->ctx, parent) : NULL;
     if (parent != JS_ATOM_NULL && !cparent)
         JS_FreeValue(s->ctx, JS_GetException(s->ctx));
+    /* Same rule as the parent: a conversion that fails leaves the field empty
+     * and the declaration still goes out, because a missing supertype is a
+     * smaller loss than a missing class. */
+    csuper = (supertype != JS_ATOM_NULL)
+        ? JS_AtomToCString(s->ctx, supertype) : NULL;
+    if (supertype != JS_ATOM_NULL && !csuper)
+        JS_FreeValue(s->ctx, JS_GetException(s->ctx));
 
     rt->symbol_handler(rt->symbol_opaque, kind, cname,
-                       cparent ? cparent : "", line);
+                       cparent ? cparent : "", csuper ? csuper : "", line);
 
+    if (csuper)
+        JS_FreeCString(s->ctx, csuper);
     JS_FreeCString(s->ctx, cname);
     if (cparent)
         JS_FreeCString(s->ctx, cparent);
@@ -25960,7 +25970,7 @@ static void set_object_name(JSParseState *s, JSAtom name)
          * left the line here; now the assignment says what to call it. */
         if (s->pending_class_line > 0) {
             js_report_symbol(s, JS_SYMBOL_CLASS, name, JS_ATOM_NULL,
-                             s->pending_class_line);
+                             JS_ATOM_NULL, s->pending_class_line);
             s->pending_class_line = -1;
         }
     }
@@ -26309,8 +26319,13 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     const uint8_t *start_ptr;
     ClassFieldsDef class_fields[2];
     /* Bintana patch: the `class` keyword's line, and a clean slate for the
-     * anonymous case `set_object_name` finishes. */
+     * anonymous case `set_object_name` finishes.  `supertype` is the name an
+     * `extends` clause carries, which the parser reads *after* the class is
+     * named -- so a class with one is reported later than it used to be, and
+     * `class_reported` is what stops the two paths reporting it twice. */
     int class_line = s->token.line_num;
+    JSAtom supertype = JS_ATOM_NULL;
+    bool class_reported = false;
     s->pending_class_line = -1;
 
     /* classes are parsed and executed in strict mode */
@@ -26333,10 +26348,19 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     /* Bintana patch: the class is a declaration the moment its name is read,
      * so a file that breaks further down still lists what it declared.  An
      * anonymous class expression has no name here and is reported by
-     * set_object_name if an assignment names it. */
-    if (class_name != JS_ATOM_NULL)
+     * set_object_name if an assignment names it.
+     *
+     * **A class with an `extends` waits for it.** The heritage has not been
+     * parsed at this point, so there is no supertype to report yet, and the
+     * report moves to just after the heritage is read -- with the `fail` path
+     * below reporting a class that never got there, which is what keeps the
+     * property this comment is about. A class that declares no `extends` is
+     * reported right here, unchanged, and is the common case. */
+    if (class_name != JS_ATOM_NULL && s->token.val != TOK_EXTENDS) {
         js_report_symbol(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
-                         class_line);
+                         JS_ATOM_NULL, class_line);
+        class_reported = true;
+    }
     if (!is_class_expr) {
         if (class_name == JS_ATOM_NULL)
             class_var_name = JS_ATOM__default_; /* export default */
@@ -26351,10 +26375,44 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         class_flags = JS_DEFINE_CLASS_HAS_HERITAGE;
         if (next_token(s))
             goto fail;
+        /* Bintana patch: an `extends` that is a plain identifier is the base
+         * class by name, and that is the whole of what a class shape needs.
+         * Nothing here parses anything -- the general expression parser below
+         * consumes the heritage, and the token is only *looked* at, so there is
+         * no lookahead and no backtracking. */
+        if (s->token.val == TOK_IDENT)
+            supertype = JS_DupAtom(ctx, s->token.u.ident.atom);
         if (js_parse_left_hand_side_expr(s))
             goto fail;
+        /* **And then it has to be checked, because the token was only the
+         * start of it.** `extends mixin(Base)` and `extends Base.field` both
+         * begin with an identifier, and the first version reported `mixin` as
+         * the base class -- a wrong answer where this comment promised none.
+         *
+         * The test is one opcode: what the heritage compiled to. A name and
+         * nothing done to it is a variable read; a call, an index or a field
+         * access all end in something else, and each of those is not a base
+         * class this can name. Four opcodes rather than a general rule,
+         * because the honest answer for an expression is no answer. */
+        if (supertype != JS_ATOM_NULL) {
+            int op = get_prev_opcode(fd);
+            if (op != OP_scope_get_var && op != OP_get_var &&
+                op != OP_get_loc && op != OP_get_loc_check) {
+                JS_FreeAtom(ctx, supertype);
+                supertype = JS_ATOM_NULL;
+            }
+        }
     } else {
         emit_op(s, OP_undefined);
+    }
+
+    /* Bintana patch: the class with its base class, now that both are read.
+     * Still ahead of the body, so a method that does not parse costs the
+     * outline nothing, and ahead of the field initialisers. */
+    if (class_name != JS_ATOM_NULL && !class_reported) {
+        js_report_symbol(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
+                         supertype, class_line);
+        class_reported = true;
     }
 
     /* add a 'const' definition for the class name */
@@ -26518,7 +26576,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             /* Bintana patch: a getter and a setter of one name are two
              * declarations, the way an editor lists them. */
             js_report_symbol(s, JS_SYMBOL_METHOD, name, class_name,
-                             member_line);
+                             JS_ATOM_NULL, member_line);
             if (is_private) {
                 method_fd->need_home_object = true; /* needed for brand check */
                 emit_op(s, OP_set_home_object);
@@ -26677,7 +26735,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             /* Bintana patch: the constructor, a static method and a plain one
              * are all methods; a computed name has none to report. */
             js_report_symbol(s, JS_SYMBOL_METHOD, name, class_name,
-                             member_line);
+                             JS_ATOM_NULL, member_line);
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
                 ctor_fd = method_fd;
@@ -26834,11 +26892,22 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             goto fail;
     }
 
+    JS_FreeAtom(ctx, supertype);
     JS_FreeAtom(ctx, class_name);
     JS_FreeAtom(ctx, class_var_name);
     fd->is_strict_mode = is_strict_mode;
     return 0;
  fail:
+    /* Bintana patch: a class that broke before it could be reported is still a
+     * declaration, which is the reason the report is early at all.  No
+     * supertype: the heritage is either what failed or what was never reached,
+     * and a missing one is a smaller loss than a missing class. */
+    if (class_name != JS_ATOM_NULL && !class_reported) {
+        js_report_symbol(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
+                         JS_ATOM_NULL, class_line);
+        class_reported = true;
+    }
+    JS_FreeAtom(ctx, supertype);
     JS_FreeAtom(ctx, name);
     JS_FreeAtom(ctx, class_name);
     JS_FreeAtom(ctx, class_var_name);
@@ -29229,7 +29298,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
                  * opcode test is what makes it precise: the pending line is only
                  * consumed when the value just parsed really was a class. */
                 js_report_symbol(s, JS_SYMBOL_CLASS, name, JS_ATOM_NULL,
-                                 s->pending_class_line);
+                                 JS_ATOM_NULL, s->pending_class_line);
                 s->pending_class_line = -1;
             }
         } else {
@@ -38317,6 +38386,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
      * function here. */
     if (func_type == JS_PARSE_FUNC_STATEMENT && fd->parent == NULL)
         js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
+                         JS_ATOM_NULL,
                          function_line_num);
 
     fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,

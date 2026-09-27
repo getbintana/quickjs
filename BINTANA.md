@@ -1,8 +1,8 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the six
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the seven
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Six patch commits plus this file, on top of `v0.17.0`.** Every patch is marked
+**Seven patch commits plus this file, on top of `v0.17.0`.** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
 those assertions are the only thing that would say so.
@@ -15,6 +15,7 @@ those assertions are the only thing that would say so.
 | 4 | `Add a per-opcode debugger hook and frame readers` | `JS_SetDebugHandler`, the `JS_Debug*` readers, and `this_obj`/`debug_line` on `JSStackFrame`. |
 | 5 | `Refuse async where it is written` | Two parser guards: the runtime installs no `Promise`, and an async closure's object would never be released. |
 | 6 | `Report a compile's declarations to the embedder` | `JS_SetSymbolHandler`: classes, methods and top-level functions with their line, for an editor's outline. |
+| 7 | `Report a class's base class to the embedder` | A `supertype` on every reported class: the name in an `extends` clause. Without it a class declared in a file the host never runs cannot say what it inherits, and an inherited surface is most of what a control has. A bare identifier only -- an `extends` that is a call or a member expression reports none, checked against the opcode the heritage compiled to. |
 
 ## Rebasing on a new upstream release
 

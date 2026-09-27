@@ -681,6 +681,11 @@ typedef enum {
     JS_SYMBOL_STATIC,
     JS_SYMBOL_GETTER,
     JS_SYMBOL_SETTER,
+    /* Bintana patch: an accessor of the *class*.  `static get Fields()` is a
+     * property of the constructor, and reporting it as a plain getter put it on
+     * the instance -- the one thing a `Record` subclass declares that way. */
+    JS_SYMBOL_STATIC_GETTER,
+    JS_SYMBOL_STATIC_SETTER,
 } JSSymbolKind;
 /* `supertype` is the name in an `extends` clause and is empty for everything
  * except a class, for a class that declares no `extends`, and for a class whose

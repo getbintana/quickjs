@@ -23061,6 +23061,18 @@ typedef struct JSFunctionDef {
     int source_len;
 
     JSModuleDef *module; /* != NULL when parsing a module */
+
+    /* Bintana patch: this function's own parameter list, in the spelling a
+     * declaration uses.  **It lives on the function and not on the parse
+     * state**, because a parameter list is read before the body and reported
+     * after it, and everything in between -- an arrow in the body, a function
+     * in a default value -- is a function with a list of its own.  The first
+     * version kept one buffer on `JSParseState` and a method reported the last
+     * nested function's parameters: `Ask(message, options)` with a
+     * `map((x, y, z) => x)` inside came out `(x,y,z)`.  A fixed buffer because
+     * a parameter list is short; zeroed by `js_mallocz`. */
+    char params_buf[256];
+    int params_len;
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -23114,12 +23126,6 @@ typedef struct JSParseState {
      * that `Foo = class {}` can be reported as `Foo` when the assignment
      * names it.  0 when there is none; `js_parse_init` memsets the state. */
     int pending_class_line;
-    /* Bintana patch: the parameter list of the function being parsed, in the
-     * spelling a declaration uses.  A fixed buffer because a parameter list is
-     * short, a class body's worth of them is not, and a `GString` would be a
-     * dependency this file does not have with upstream. */
-    char params_buf[256];
-    int params_len;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -25900,19 +25906,20 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
     return tok;
 }
 
-/* Bintana patch: one parameter into `s->params_buf`, in the spelling a
+/* Bintana patch: one parameter into `fd->params_buf`, in the spelling a
  * declaration uses.  `[name]` is optional, `...name` is a rest, and a
  * destructuring parameter has no name to write so it gets one a reader can see.
  * A list longer than the buffer stops at a parameter boundary rather than
  * mid-word, and the truncation is then visible because the result is unbalanced
  * -- the better failure for a host that is about to write a declaration. */
-static void js_report_param(JSParseState *s, JSAtom name, bool optional,
-                            bool rest)
+static void js_report_param(JSParseState *s, JSFunctionDef *fd, JSAtom name,
+                            bool optional, bool rest)
 {
     char buf[64];
-    int  n = 0, len = s->params_len, i;
+    int  n = 0, len = fd->params_len, i;
 
-    if (len + 1 >= (int) sizeof(s->params_buf))
+    /* Room for the `, ` and the terminator, or the list stops here. */
+    if (len + 3 >= (int) sizeof(fd->params_buf))
         return;
     if (rest) { buf[n++] = '.'; buf[n++] = '.'; buf[n++] = '.'; }
     if (optional) buf[n++] = '[';
@@ -25929,11 +25936,13 @@ static void js_report_param(JSParseState *s, JSAtom name, bool optional,
     if (optional) buf[n++] = ']';
     buf[n] = 0;
 
-    if (s->params_len) s->params_buf[len++] = ',';
-    for (i = 0; i < n && len < (int) sizeof(s->params_buf) - 1; i++)
-        s->params_buf[len++] = buf[i];
-    s->params_buf[len] = 0;
-    s->params_len = len;
+    /* `, ` and not `,`: the spelling a declaration and a class's own
+     * `Signatures` use, so the host has nothing to translate. */
+    if (fd->params_len) { fd->params_buf[len++] = ','; fd->params_buf[len++] = ' '; }
+    for (i = 0; i < n && len < (int) sizeof(fd->params_buf) - 1; i++)
+        fd->params_buf[len++] = buf[i];
+    fd->params_buf[len] = 0;
+    fd->params_len = len;
 }
 
 /*
@@ -25977,7 +25986,7 @@ static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
      * which is also what a class's own `Signatures` says.  One spelling for both
      * is the point: a host that has to translate between two would be the copy
      * that drifts. */
-    char pbuf[sizeof(s->params_buf) + 4];
+    char pbuf[sizeof(((JSFunctionDef *) 0)->params_buf) + 4];
     const char *preported = "";
     if (params) {
         /* **A member with no parameters is `()` and not "".** The empty string is
@@ -25985,7 +25994,9 @@ static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
          * writes `Name` where a class body means `Name()` is worse than one that
          * writes the pair: the first looks like a property. */
         bool member = (kind == JS_SYMBOL_METHOD || kind == JS_SYMBOL_STATIC ||
-                       kind == JS_SYMBOL_GETTER || kind == JS_SYMBOL_SETTER);
+                       kind == JS_SYMBOL_GETTER || kind == JS_SYMBOL_SETTER ||
+                       kind == JS_SYMBOL_STATIC_GETTER ||
+                       kind == JS_SYMBOL_STATIC_SETTER);
         if (*params || member) {
             snprintf(pbuf, sizeof(pbuf), "(%s)", params ? params : "");
             preported = pbuf;
@@ -26641,9 +26652,11 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
              * part of the report**, because a property and a method that answer
              * the same name are the difference between `Name: T` and
              * `Name(): T` in a declaration. */
-            js_report_symbol(s, is_set ? JS_SYMBOL_SETTER : JS_SYMBOL_GETTER,
+            js_report_symbol(s, is_static
+                                ? (is_set ? JS_SYMBOL_STATIC_SETTER : JS_SYMBOL_STATIC_GETTER)
+                                : (is_set ? JS_SYMBOL_SETTER : JS_SYMBOL_GETTER),
                              name, class_name, JS_ATOM_NULL,
-                             s->params_buf, member_line);
+                             method_fd->params_buf, member_line);
             if (is_private) {
                 method_fd->need_home_object = true; /* needed for brand check */
                 emit_op(s, OP_set_home_object);
@@ -26806,7 +26819,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
              * class and not of an instance, and a caller writes them differently. */
             js_report_symbol(s, is_static ? JS_SYMBOL_STATIC : JS_SYMBOL_METHOD,
                              name, class_name, JS_ATOM_NULL,
-                             s->params_buf, member_line);
+                             method_fd->params_buf, member_line);
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
                 ctor_fd = method_fd;
@@ -38323,6 +38336,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     int func_idx, lexical_func_idx = -1;
     bool has_opt_arg;
     bool create_func_var = false;
+    bool report_top = false;    /* Bintana patch: see where it is set */
 
     /*
      * Bintana patch: `async` is refused where it is written.
@@ -38454,11 +38468,11 @@ static __exception int js_parse_function_decl2(JSParseState *s,
      * declaration an editor lists; one inside another function is that body's
      * business.  Methods are reported by js_parse_class, which is the only
      * place that knows the class they belong to.  `fd` is still the enclosing
-     * function here. */
-    if (func_type == JS_PARSE_FUNC_STATEMENT && fd->parent == NULL)
-        js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
-                         JS_ATOM_NULL, s->params_buf,
-                         function_line_num);
+     * function here, which is why the question is asked now -- and the report
+     * waits until the parameters are read, since before them there is nothing
+     * of this function's to say.  The first version reported here, and handed
+     * over whatever the previous function had left in a shared buffer. */
+    report_top = (func_type == JS_PARSE_FUNC_STATEMENT && fd->parent == NULL);
 
     fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
                              function_line_num, function_col_num);
@@ -38558,8 +38572,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
          * here and once here**, and the first version put the zero inside the
          * loop, which kept only the last parameter of a method with more than
          * one: `Make(a, b)` reported `b`. */
-        s->params_len = 0;
-        s->params_buf[0] = 0;
+        fd->params_len = 0;
+        fd->params_buf[0] = 0;
 
         while (s->token.val != ')') {
             JSAtom name;
@@ -38586,7 +38600,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 }
                 /* Bintana patch: a destructuring parameter has no name to
                  * report, and `a` says there is one. */
-                js_report_param(s, JS_ATOM_NULL, has_opt_arg, rest);
+                js_report_param(s, fd, JS_ATOM_NULL, has_opt_arg, rest);
                 has_initializer = js_parse_destructuring_element(s, fd->has_parameter_expressions ? TOK_LET : TOK_VAR, true, true, -1, true, false);
                 if (has_initializer < 0)
                     goto fail;
@@ -38679,7 +38693,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                  * reported `a,...[rest]` -- a rest that takes nothing, which is
                  * the opposite of what it is.  A declaration's spelling for one
                  * is `...rest`. */
-                js_report_param(s, name, rest ? false : has_opt_arg, rest);
+                js_report_param(s, fd, name, rest ? false : has_opt_arg, rest);
             } else {
                 js_parse_error(s, "missing formal parameter");
                 goto fail;
@@ -38698,6 +38712,14 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             js_parse_error(s, "invalid number of arguments for getter or setter");
             goto fail;
         }
+    }
+
+    /* Bintana patch: the parameters are read and the body is not, so this is
+     * the one moment the report is both complete and early. */
+    if (report_top) {
+        js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
+                         JS_ATOM_NULL, fd->params_buf, function_line_num);
+        report_top = false;
     }
 
     if (fd->has_parameter_expressions) {
@@ -38955,6 +38977,12 @@ done:
     }
     return 0;
  fail:
+    /* Bintana patch: a function whose parameter list broke is still a
+     * declaration, with what was read of the list -- the property the early
+     * report existed for, since a half-typed file is the ordinary state. */
+    if (report_top)
+        js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
+                         JS_ATOM_NULL, fd->params_buf, function_line_num);
     s->cur_func = fd->parent;
     js_free_function_def(ctx, fd);
     if (pfd)

@@ -673,6 +673,14 @@ typedef enum {
     JS_SYMBOL_CLASS,
     JS_SYMBOL_METHOD,
     JS_SYMBOL_FUNCTION,
+    /* Bintana patch: a member of a class is a method, and the three ways of not
+     * being one all arrive at js_parse_class as a method of the same name.  An
+     * editor asked "what does this class have" cannot offer a property and a
+     * function in the same voice, and which one a name is decides whether a
+     * declaration says `Name: T` or `Name(): T`. */
+    JS_SYMBOL_STATIC,
+    JS_SYMBOL_GETTER,
+    JS_SYMBOL_SETTER,
 } JSSymbolKind;
 /* `supertype` is the name in an `extends` clause and is empty for everything
  * except a class, for a class that declares no `extends`, and for a class whose
@@ -681,9 +689,18 @@ typedef enum {
  * emitted bytecode back, and the answer a class's base class is wanted from is
  * `Base` or `ns.Base` in every declaration that matters -- an editor asking
  * "what does this class have" needs the chain, not the expression. */
+/* `params` is a method's parameter list in the spelling a declaration uses --
+ * `(message, [options], ...rest)` -- and is "" for everything else.  It is here
+ * because the information exists: the parameter loop in js_parse_function_decl2
+ * has every name, whether it is optional and whether it is a rest, and the
+ * function *object* does not, since ECMAScript discards a parameter's name at
+ * parse time.  A host with a class in a file it never ran has nothing else to
+ * ask, and `Function.length` -- which does survive -- is a lower bound the
+ * moment one parameter has a default. */
 typedef void JSSymbolHandler(void *opaque, JSSymbolKind kind,
                              const char *name, const char *parent,
-                             const char *supertype, int line);
+                             const char *supertype, const char *params,
+                             int line);
 JS_EXTERN void JS_SetSymbolHandler(JSRuntime *rt, JSSymbolHandler *cb,
                                    void *opaque);
 

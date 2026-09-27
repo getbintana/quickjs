@@ -25954,18 +25954,32 @@ static void js_report_param(JSParseState *s, JSFunctionDef *fd, JSAtom name,
  * declaration is left out, and the compile carries on.  See JS_SetSymbolHandler
  * in quickjs.h.
  */
+static void js_report_symbol_span(JSParseState *s, JSSymbolKind kind,
+                                  JSAtom name, JSAtom parent, JSAtom supertype,
+                                  const char *params, int line, int end_line);
+
 static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
                              JSAtom name, JSAtom parent, JSAtom supertype,
                              const char *params, int line)
 {
+    js_report_symbol_span(s, kind, name, parent, supertype, params, line, 0);
+}
+
+static void js_report_symbol_span(JSParseState *s, JSSymbolKind kind,
+                                  JSAtom name, JSAtom parent, JSAtom supertype,
+                                  const char *params, int line, int end_line)
+{
     JSRuntime  *rt = s->ctx->rt;
     const char *cname, *cparent, *csuper;
 
-    if (!rt->symbol_handler || name == JS_ATOM_NULL)
+    /* A scope may be anonymous -- an arrow, a function expression -- and is
+     * still a scope; every other kind is a name or nothing. */
+    if (!rt->symbol_handler ||
+        (name == JS_ATOM_NULL && kind != JS_SYMBOL_SCOPE))
         return;
 
-    cname = JS_AtomToCString(s->ctx, name);
-    if (!cname) {
+    cname = name != JS_ATOM_NULL ? JS_AtomToCString(s->ctx, name) : NULL;
+    if (name != JS_ATOM_NULL && !cname) {
         JS_FreeValue(s->ctx, JS_GetException(s->ctx));
         return;
     }
@@ -25996,20 +26010,22 @@ static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
         bool member = (kind == JS_SYMBOL_METHOD || kind == JS_SYMBOL_STATIC ||
                        kind == JS_SYMBOL_GETTER || kind == JS_SYMBOL_SETTER ||
                        kind == JS_SYMBOL_STATIC_GETTER ||
-                       kind == JS_SYMBOL_STATIC_SETTER);
+                       kind == JS_SYMBOL_STATIC_SETTER ||
+                       kind == JS_SYMBOL_SCOPE);
         if (*params || member) {
             snprintf(pbuf, sizeof(pbuf), "(%s)", params ? params : "");
             preported = pbuf;
         }
     }
 
-    rt->symbol_handler(rt->symbol_opaque, kind, cname,
+    rt->symbol_handler(rt->symbol_opaque, kind, cname ? cname : "",
                        cparent ? cparent : "", csuper ? csuper : "",
-                       preported, line);
+                       preported, line, end_line);
 
     if (csuper)
         JS_FreeCString(s->ctx, csuper);
-    JS_FreeCString(s->ctx, cname);
+    if (cname)
+        JS_FreeCString(s->ctx, cname);
     if (cparent)
         JS_FreeCString(s->ctx, cparent);
 }
@@ -27452,6 +27468,13 @@ static __exception int js_define_var(JSParseState *s, JSAtom name, int tok)
     }
     if (define_var(s, fd, name, var_def_type) < 0)
         return -1;
+    /* Bintana patch: every declaration a name can come from -- a `let`, a
+     * `const`, a `var`, a `catch` binding, each name a destructuring declares,
+     * the variable of a `for...of` -- goes through here, which is why the
+     * report is here and not at the four callers.  The name has been read, so
+     * the line is the previous token's. */
+    js_report_symbol(s, JS_SYMBOL_VARIABLE, name, JS_ATOM_NULL, JS_ATOM_NULL,
+                     NULL, s->last_line_num);
     return 0;
 }
 
@@ -38866,6 +38889,13 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
     }
 done:
+    /* Bintana patch: the function as a span -- its parameters, the line it
+     * starts on and the line its last token was on -- so an editor can tell
+     * which functions contain the cursor.  Every function, anonymous ones
+     * included: an arrow's parameters are in scope inside it like any other. */
+    js_report_symbol_span(s, JS_SYMBOL_SCOPE, fd->func_name, JS_ATOM_NULL,
+                          JS_ATOM_NULL, fd->params_buf, function_line_num,
+                          s->last_line_num);
     s->cur_func = fd->parent;
 
     /* Reparse identifiers after the function is terminated so that
@@ -38983,6 +39013,12 @@ done:
     if (report_top)
         js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
                          JS_ATOM_NULL, fd->params_buf, function_line_num);
+    /* ...and a function that broke is a scope up to where it broke, which is
+     * where somebody is typing: the cursor is inside it. */
+    if (fd && fd->parent)
+        js_report_symbol_span(s, JS_SYMBOL_SCOPE, fd->func_name, JS_ATOM_NULL,
+                              JS_ATOM_NULL, fd->params_buf, function_line_num,
+                              s->token.line_num);
     s->cur_func = fd->parent;
     js_free_function_def(ctx, fd);
     if (pfd)

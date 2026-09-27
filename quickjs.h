@@ -686,6 +686,15 @@ typedef enum {
      * the instance -- the one thing a `Record` subclass declares that way. */
     JS_SYMBOL_STATIC_GETTER,
     JS_SYMBOL_STATIC_SETTER,
+    /* Bintana patch: what a name can mean *where the cursor is*.  A variable
+     * is every `let`/`const`/`var` (and a `catch` binding, and each name a
+     * destructuring declares) at the line it is written; a scope is every
+     * function -- a declaration, a method, an expression, an arrow -- with
+     * its parameters and the lines it spans, `end_line` being the last.  An
+     * editor puts the two together: the scopes that contain a line, their
+     * parameters, and the variables declared inside them above it. */
+    JS_SYMBOL_VARIABLE,
+    JS_SYMBOL_SCOPE,
 } JSSymbolKind;
 /* `supertype` is the name in an `extends` clause and is empty for everything
  * except a class, for a class that declares no `extends`, and for a class whose
@@ -702,10 +711,12 @@ typedef enum {
  * parse time.  A host with a class in a file it never ran has nothing else to
  * ask, and `Function.length` -- which does survive -- is a lower bound the
  * moment one parameter has a default. */
+/* `end_line` is the last line of a `JS_SYMBOL_SCOPE`, and 0 for every other
+ * kind. */
 typedef void JSSymbolHandler(void *opaque, JSSymbolKind kind,
                              const char *name, const char *parent,
                              const char *supertype, const char *params,
-                             int line);
+                             int line, int end_line);
 JS_EXTERN void JS_SetSymbolHandler(JSRuntime *rt, JSSymbolHandler *cb,
                                    void *opaque);
 

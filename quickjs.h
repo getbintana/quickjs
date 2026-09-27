@@ -695,6 +695,12 @@ typedef enum {
      * parameters, and the variables declared inside them above it. */
     JS_SYMBOL_VARIABLE,
     JS_SYMBOL_SCOPE,
+    /* Bintana patch: a function assigned at the top level of the file --
+     * `File.LoadJson = function (path) {}`, `Widget.prototype.Dump = ...` --
+     * which is how a runtime adds to a class it did not declare.  The name is
+     * the target as written, dots and all, and it carries its parameters and
+     * its documentation like a method. */
+    JS_SYMBOL_ASSIGNED,
 } JSSymbolKind;
 /* `supertype` is the name in an `extends` clause and is empty for everything
  * except a class, for a class that declares no `extends`, and for a class whose
@@ -712,11 +718,14 @@ typedef enum {
  * ask, and `Function.length` -- which does survive -- is a lower bound the
  * moment one parameter has a default. */
 /* `end_line` is the last line of a `JS_SYMBOL_SCOPE`, and 0 for every other
- * kind. */
+ * kind.  `doc` is the text of a JSDoc (a comment opening with two stars) comment that ends on the line
+ * before the declaration (or on its line), delimiters taken off and nothing
+ * else done to it, or "" -- a class, a member and a top-level function carry
+ * one; a variable and a scope do not. */
 typedef void JSSymbolHandler(void *opaque, JSSymbolKind kind,
                              const char *name, const char *parent,
                              const char *supertype, const char *params,
-                             int line, int end_line);
+                             int line, int end_line, const char *doc);
 JS_EXTERN void JS_SetSymbolHandler(JSRuntime *rt, JSSymbolHandler *cb,
                                    void *opaque);
 

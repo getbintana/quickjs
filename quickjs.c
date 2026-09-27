@@ -23126,6 +23126,22 @@ typedef struct JSParseState {
      * that `Foo = class {}` can be reported as `Foo` when the assignment
      * names it.  0 when there is none; `js_parse_init` memsets the state. */
     int pending_class_line;
+    /* Bintana patch: the last JSDoc (a comment opening with two stars) comment the lexer skipped, as a
+     * span of the source and the line it ended on, so the declaration right
+     * after it can take it as its documentation (`js_take_doc`).  NULL when
+     * there is none or it was taken. */
+    const uint8_t *doc_start;
+    const uint8_t *doc_end;
+    int doc_end_line;
+    /* ...and the one an anonymous class took, held until the assignment that
+     * names it reports it. */
+    char *pending_class_doc;
+    /* ...and the target of the top-level assignment whose right side is the
+     * object literal about to be parsed -- `GLOBAL.Settings = { ... }` -- so
+     * that literal reports each function it holds as assigned to
+     * `<target>.<name>`.  Taken by the literal it was meant for, so a literal
+     * nested inside it owns nothing. */
+    JSAtom literal_owner;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -23845,6 +23861,11 @@ static __exception int next_token(JSParseState *s)
     case '/':
         if (p[1] == '*') {
             /* comment */
+            /* Bintana patch: a comment that opens with two stars (and is not the
+             * empty one) is documentation, kept for the declaration after
+             * it. */
+            bool is_doc = p[2] == '*' && p[3] != '/';
+            const uint8_t *doc_from = p + 3;
             p += 2;
             for(;;) {
                 if (*p == '\0' && p >= s->buf_end) {
@@ -23852,6 +23873,11 @@ static __exception int next_token(JSParseState *s)
                     goto fail;
                 }
                 if (p[0] == '*' && p[1] == '/') {
+                    if (is_doc) {
+                        s->doc_start    = doc_from;
+                        s->doc_end      = p;
+                        s->doc_end_line = s->line_num;
+                    }
                     p += 2;
                     break;
                 }
@@ -25954,20 +25980,76 @@ static void js_report_param(JSParseState *s, JSFunctionDef *fd, JSAtom name,
  * declaration is left out, and the compile carries on.  See JS_SetSymbolHandler
  * in quickjs.h.
  */
+/* Bintana patch: the documentation of a declaration on `line` -- the last
+ * JSDoc (a comment opening with two stars) comment, when it ended on the line before or on this one --
+ * as a string the caller frees, taken so the next declaration does not take
+ * it too.  NULL when there is none, or no handler to hand it to. */
+static bool js_doc_adjacent(JSParseState *s, int line);
+
+static char *js_take_doc(JSParseState *s, int line)
+{
+    char *doc = NULL;
+
+    if (s->ctx->rt->symbol_handler && js_doc_adjacent(s, line)) {
+        size_t n = s->doc_end - s->doc_start;
+        doc = js_malloc(s->ctx, n + 1);
+        if (doc) {
+            memcpy(doc, s->doc_start, n);
+            doc[n] = '\0';
+        }
+    }
+    s->doc_start = NULL;
+    return doc;
+}
+
+/* Whether the last JSDoc comment belongs to a declaration on `line` that
+ * starts at the current token -- see `js_take_doc`, which also takes it. */
+static bool js_doc_adjacent(JSParseState *s, int line)
+{
+
+    /* And nothing between the comment and the declaration but words, dots,
+     * `=` and space -- `static`, `get`, `function`, `Ide.Name =`.  The line
+     * alone was not enough: a comment at the end of one method's body sits
+     * on the line before the next method, and was taken as its doc. */
+    bool adjacent = s->doc_start != NULL;
+    if (adjacent) {
+        for (const uint8_t *q = s->doc_end + 2; q < s->token.ptr; q++) {
+            if (!(lre_js_is_ident_next(*q) || *q == '.' || *q == '=' ||
+                  *q == '*' || *q == ' ' || *q == '\t' || *q == '\n' ||
+                  *q == '\r')) {
+                adjacent = false;
+                break;
+            }
+        }
+    }
+    return adjacent && s->doc_end_line >= line - 1 && s->doc_end_line <= line;
+}
+
+static void js_report_symbol_full(JSParseState *s, JSSymbolKind kind,
+                                  JSAtom name, JSAtom parent, JSAtom supertype,
+                                  const char *params, int line, int end_line,
+                                  const char *doc);
+
 static void js_report_symbol_span(JSParseState *s, JSSymbolKind kind,
                                   JSAtom name, JSAtom parent, JSAtom supertype,
-                                  const char *params, int line, int end_line);
+                                  const char *params, int line, int end_line)
+{
+    js_report_symbol_full(s, kind, name, parent, supertype, params, line,
+                          end_line, NULL);
+}
 
 static void js_report_symbol(JSParseState *s, JSSymbolKind kind,
                              JSAtom name, JSAtom parent, JSAtom supertype,
                              const char *params, int line)
 {
-    js_report_symbol_span(s, kind, name, parent, supertype, params, line, 0);
+    js_report_symbol_full(s, kind, name, parent, supertype, params, line, 0,
+                          NULL);
 }
 
-static void js_report_symbol_span(JSParseState *s, JSSymbolKind kind,
+static void js_report_symbol_full(JSParseState *s, JSSymbolKind kind,
                                   JSAtom name, JSAtom parent, JSAtom supertype,
-                                  const char *params, int line, int end_line)
+                                  const char *params, int line, int end_line,
+                                  const char *doc)
 {
     JSRuntime  *rt = s->ctx->rt;
     const char *cname, *cparent, *csuper;
@@ -26011,7 +26093,8 @@ static void js_report_symbol_span(JSParseState *s, JSSymbolKind kind,
                        kind == JS_SYMBOL_GETTER || kind == JS_SYMBOL_SETTER ||
                        kind == JS_SYMBOL_STATIC_GETTER ||
                        kind == JS_SYMBOL_STATIC_SETTER ||
-                       kind == JS_SYMBOL_SCOPE);
+                       kind == JS_SYMBOL_SCOPE ||
+                       kind == JS_SYMBOL_ASSIGNED);
         if (*params || member) {
             snprintf(pbuf, sizeof(pbuf), "(%s)", params ? params : "");
             preported = pbuf;
@@ -26020,7 +26103,7 @@ static void js_report_symbol_span(JSParseState *s, JSSymbolKind kind,
 
     rt->symbol_handler(rt->symbol_opaque, kind, cname ? cname : "",
                        cparent ? cparent : "", csuper ? csuper : "",
-                       preported, line, end_line);
+                       preported, line, end_line, doc ? doc : "");
 
     if (csuper)
         JS_FreeCString(s->ctx, csuper);
@@ -26059,8 +26142,11 @@ static void set_object_name(JSParseState *s, JSAtom name)
          * was anonymous when js_parse_class saw it, so it reported nothing and
          * left the line here; now the assignment says what to call it. */
         if (s->pending_class_line > 0) {
-            js_report_symbol(s, JS_SYMBOL_CLASS, name, JS_ATOM_NULL,
-                             JS_ATOM_NULL, NULL, s->pending_class_line);
+            js_report_symbol_full(s, JS_SYMBOL_CLASS, name, JS_ATOM_NULL,
+                                  JS_ATOM_NULL, NULL, s->pending_class_line, 0,
+                                  s->pending_class_doc);
+            js_free(s->ctx, s->pending_class_doc);
+            s->pending_class_doc = NULL;
             s->pending_class_line = -1;
         }
     }
@@ -26087,12 +26173,50 @@ static void set_object_name_computed(JSParseState *s)
     }
 }
 
+/* Bintana patch: a function held by the object literal a top-level
+ * assignment builds is reported as assigned to `<owner>.<name>`, with the
+ * parameters of the function just parsed -- the last child of the current
+ * one -- and its own documentation. */
+static void js_report_literal_member(JSParseState *s, JSAtom owner,
+                                     JSAtom name, int line, const char *doc,
+                                     bool getter)
+{
+    JSFunctionDef *fd = s->cur_func;
+    if (list_empty(&fd->child_list))
+        return;
+    JSFunctionDef *fn = list_entry(fd->child_list.prev, JSFunctionDef, link);
+    const char *o = JS_AtomToCString(s->ctx, owner);
+    const char *n = JS_AtomToCString(s->ctx, name);
+    char *text = (o && n) ? js_malloc(s->ctx, strlen(o) + strlen(n) + 2) : NULL;
+    if (text) {
+        strcpy(text, o);
+        strcat(text, ".");
+        strcat(text, n);
+    }
+    JS_FreeCString(s->ctx, o);
+    JS_FreeCString(s->ctx, n);
+    if (!text)
+        return;
+    JSAtom target = JS_NewAtom(s->ctx, text);
+    js_free(s->ctx, text);
+    if (target == JS_ATOM_NULL)
+        return;
+    js_report_symbol_full(s, JS_SYMBOL_ASSIGNED, target, JS_ATOM_NULL,
+                          JS_ATOM_NULL, getter ? NULL : fn->params_buf, line,
+                          0, doc);
+    JS_FreeAtom(s->ctx, target);
+}
+
 static __exception int js_parse_object_literal(JSParseState *s)
 {
     JSAtom name = JS_ATOM_NULL;
     const uint8_t *start_ptr;
     int start_line, start_col, prop_type;
     bool has_proto;
+    /* Bintana patch: see `literal_owner`. */
+    JSAtom owner = s->literal_owner;
+    char *member_doc = NULL;
+    s->literal_owner = JS_ATOM_NULL;
 
     if (next_token(s))
         goto fail;
@@ -26104,6 +26228,10 @@ static __exception int js_parse_object_literal(JSParseState *s)
         start_ptr = s->token.ptr;
         start_line = s->token.line_num;
         start_col = s->token.col_num;
+        if (owner != JS_ATOM_NULL) {
+            js_free(s->ctx, member_doc);
+            member_doc = js_take_doc(s, start_line);
+        }
 
         if (s->token.val == TOK_ELLIPSIS) {
             if (next_token(s))
@@ -26151,6 +26279,12 @@ static __exception int js_parse_object_literal(JSParseState *s)
             if (js_parse_function_decl(s, func_type, func_kind, JS_ATOM_NULL,
                                        start_ptr, start_line, start_col))
                 goto fail;
+            /* A getter is reported with no parameters, which is what says it
+             * is read and not called; a setter is the same name again. */
+            if (owner != JS_ATOM_NULL && prop_type != PROP_TYPE_SET &&
+                name != JS_ATOM_NULL)
+                js_report_literal_member(s, owner, name, start_line, member_doc,
+                                         is_getset);
             if (name == JS_ATOM_NULL) {
                 emit_op(s, OP_define_method_computed);
             } else {
@@ -26169,6 +26303,12 @@ static __exception int js_parse_object_literal(JSParseState *s)
                 goto fail;
             if (js_parse_assign_expr(s))
                 goto fail;
+            if (owner != JS_ATOM_NULL && name != JS_ATOM_NULL) {
+                int last = get_prev_opcode(s->cur_func);
+                if (last == OP_fclosure || last == OP_set_name)
+                    js_report_literal_member(s, owner, name, start_line,
+                                             member_doc, false);
+            }
             if (name == JS_ATOM_NULL) {
                 set_object_name_computed(s);
                 emit_op(s, OP_define_array_el);
@@ -26196,8 +26336,12 @@ static __exception int js_parse_object_literal(JSParseState *s)
     }
     if (js_parse_expect(s, '}'))
         goto fail;
+    js_free(s->ctx, member_doc);
+    JS_FreeAtom(s->ctx, owner);
     return 0;
  fail:
+    js_free(s->ctx, member_doc);
+    JS_FreeAtom(s->ctx, owner);
     JS_FreeAtom(s->ctx, name);
     return -1;
 }
@@ -26416,6 +26560,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     int class_line = s->token.line_num;
     JSAtom supertype = JS_ATOM_NULL;
     bool class_reported = false;
+    char *class_doc = js_take_doc(s, class_line);
+    char *member_doc = NULL;
     s->pending_class_line = -1;
 
     /* classes are parsed and executed in strict mode */
@@ -26447,8 +26593,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
      * property this comment is about. A class that declares no `extends` is
      * reported right here, unchanged, and is the common case. */
     if (class_name != JS_ATOM_NULL && s->token.val != TOK_EXTENDS) {
-        js_report_symbol(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
-                         JS_ATOM_NULL, NULL, class_line);
+        js_report_symbol_full(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
+                              JS_ATOM_NULL, NULL, class_line, 0, class_doc);
         class_reported = true;
     }
     if (!is_class_expr) {
@@ -26500,8 +26646,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
      * Still ahead of the body, so a method that does not parse costs the
      * outline nothing, and ahead of the field initialisers. */
     if (class_name != JS_ATOM_NULL && !class_reported) {
-        js_report_symbol(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
-                         supertype, NULL, class_line);
+        js_report_symbol_full(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
+                              supertype, NULL, class_line, 0, class_doc);
         class_reported = true;
     }
 
@@ -26612,8 +26758,12 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             emit_op(s, OP_swap);
         start_ptr = s->token.ptr;
         /* Bintana patch: the line the member's own first token is on -- which
-         * is the name and not the `static` or the `(`. */
+         * is the name and not the `static` or the `(` -- and its documentation,
+         * taken now: by the time the member is reported its body has been
+         * read, and the last comment is whatever was inside it. */
         int member_line = s->token.line_num;
+        js_free(ctx, member_doc);
+        member_doc = js_take_doc(s, member_line);
         if (prop_type < 0) {
             prop_type = js_parse_property_name(s, &name, true, false, true);
             if (prop_type < 0)
@@ -26668,11 +26818,11 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
              * part of the report**, because a property and a method that answer
              * the same name are the difference between `Name: T` and
              * `Name(): T` in a declaration. */
-            js_report_symbol(s, is_static
+            js_report_symbol_full(s, is_static
                                 ? (is_set ? JS_SYMBOL_STATIC_SETTER : JS_SYMBOL_STATIC_GETTER)
                                 : (is_set ? JS_SYMBOL_SETTER : JS_SYMBOL_GETTER),
                              name, class_name, JS_ATOM_NULL,
-                             method_fd->params_buf, member_line);
+                             method_fd->params_buf, member_line, 0, member_doc);
             if (is_private) {
                 method_fd->need_home_object = true; /* needed for brand check */
                 emit_op(s, OP_set_home_object);
@@ -26833,9 +26983,9 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
              * is told apart from the plain one**, which is the half an editor
              * needs: `Chart.Refresh` and `Widget.New` are properties of their
              * class and not of an instance, and a caller writes them differently. */
-            js_report_symbol(s, is_static ? JS_SYMBOL_STATIC : JS_SYMBOL_METHOD,
+            js_report_symbol_full(s, is_static ? JS_SYMBOL_STATIC : JS_SYMBOL_METHOD,
                              name, class_name, JS_ATOM_NULL,
-                             method_fd->params_buf, member_line);
+                             method_fd->params_buf, member_line, 0, member_doc);
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
                 func_type == JS_PARSE_FUNC_CLASS_CONSTRUCTOR) {
                 ctor_fd = method_fd;
@@ -26979,8 +27129,12 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             emit_op(s, OP_set_class_name);
             emit_u32(s, fd->last_opcode_pos + 1 - define_class_offset);
             /* Bintana patch: `Foo = class {}` is named by the assignment a
-             * moment from now -- see set_object_name. */
+             * moment from now -- see set_object_name -- and carries its
+             * documentation until then. */
             s->pending_class_line = class_line;
+            js_free(ctx, s->pending_class_doc);
+            s->pending_class_doc = class_doc;
+            class_doc = NULL;
         }
     }
 
@@ -26995,6 +27149,8 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     JS_FreeAtom(ctx, supertype);
     JS_FreeAtom(ctx, class_name);
     JS_FreeAtom(ctx, class_var_name);
+    js_free(ctx, class_doc);
+    js_free(ctx, member_doc);
     fd->is_strict_mode = is_strict_mode;
     return 0;
  fail:
@@ -27003,10 +27159,12 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
      * supertype: the heritage is either what failed or what was never reached,
      * and a missing one is a smaller loss than a missing class. */
     if (class_name != JS_ATOM_NULL && !class_reported) {
-        js_report_symbol(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
-                         JS_ATOM_NULL, NULL, class_line);
+        js_report_symbol_full(s, JS_SYMBOL_CLASS, class_name, JS_ATOM_NULL,
+                              JS_ATOM_NULL, NULL, class_line, 0, class_doc);
         class_reported = true;
     }
+    js_free(ctx, class_doc);
+    js_free(ctx, member_doc);
     JS_FreeAtom(ctx, supertype);
     JS_FreeAtom(ctx, name);
     JS_FreeAtom(ctx, class_name);
@@ -29348,8 +29506,23 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         /* name0 is used to check for OP_set_name pattern, not duplicated */
         name0 = s->token.u.ident.atom;
     }
+    /* Bintana patch: where the target of a top-level assignment starts, and
+     * the documentation above it, looked at now and not taken -- a class on
+     * the right takes it itself, and by the time a function on the right is
+     * read the last comment is one inside its body.  Pointers into the
+     * source, which outlives the parse, so nothing is copied unless it is
+     * reported. */
+    const uint8_t *lhs_start = s->token.ptr;
+    int lhs_line = s->token.line_num;
+    bool top = s->ctx->rt->symbol_handler && s->cur_func->parent == NULL;
+    const uint8_t *adoc_start = NULL, *adoc_end = NULL;
+    if (top && js_doc_adjacent(s, lhs_line)) {
+        adoc_start = s->doc_start;
+        adoc_end   = s->doc_end;
+    }
     if (js_parse_cond_expr(s, parse_flags))
         return -1;
+    const uint8_t *lhs_end = s->token.ptr;
 
     op = s->token.val;
     if (op == '=' || (op >= TOK_MUL_ASSIGN && op <= TOK_POW_ASSIGN)) {
@@ -29382,6 +29555,17 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_op(s, OP_swap);
         }
 
+        /* Bintana patch: `Target = { ... }` at the top level -- the literal
+         * reports what it holds, see `literal_owner`. */
+        if (top && op == '=' && s->token.val == '{' && lhs_end > lhs_start) {
+            const uint8_t *e = lhs_end;
+            while (e > lhs_start && (e[-1] == ' ' || e[-1] == '\t' ||
+                                     e[-1] == '\n' || e[-1] == '\r'))
+                e--;
+            JS_FreeAtom(s->ctx, s->literal_owner);
+            s->literal_owner = JS_NewAtomLen(s->ctx, (const char *)lhs_start,
+                                             e - lhs_start);
+        }
         if (js_parse_assign_expr2(s, parse_flags)) {
             JS_FreeAtom(s->ctx, name);
             return -1;
@@ -29394,6 +29578,38 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         }
 
         if (op == '=') {
+            /* Bintana patch: a function assigned at the top level is a
+             * declaration of the target, as written -- see
+             * JS_SYMBOL_ASSIGNED.  What was just parsed is a function when the
+             * last opcode made a closure (and named an anonymous one). */
+            int last = get_prev_opcode(s->cur_func);
+            if (top && lhs_end > lhs_start &&
+                (last == OP_fclosure || last == OP_set_name) &&
+                !list_empty(&s->cur_func->child_list)) {
+                JSFunctionDef *rhs = list_entry(s->cur_func->child_list.prev,
+                                                JSFunctionDef, link);
+                const uint8_t *e = lhs_end;
+                while (e > lhs_start && (e[-1] == ' ' || e[-1] == '\t' ||
+                                         e[-1] == '\n' || e[-1] == '\r'))
+                    e--;
+                JSAtom target = JS_NewAtomLen(s->ctx, (const char *)lhs_start,
+                                              e - lhs_start);
+                char *doc = NULL;
+                if (adoc_start) {
+                    size_t n = adoc_end - adoc_start;
+                    doc = js_malloc(s->ctx, n + 1);
+                    if (doc) {
+                        memcpy(doc, adoc_start, n);
+                        doc[n] = '\0';
+                    }
+                }
+                if (target != JS_ATOM_NULL)
+                    js_report_symbol_full(s, JS_SYMBOL_ASSIGNED, target,
+                                          JS_ATOM_NULL, JS_ATOM_NULL,
+                                          rhs->params_buf, lhs_line, 0, doc);
+                js_free(s->ctx, doc);
+                JS_FreeAtom(s->ctx, target);
+            }
             if ((opcode == OP_get_ref_value || opcode == OP_scope_get_var) && name == name0) {
                 set_object_name(s, name);
             } else if (s->pending_class_line > 0 &&
@@ -29404,8 +29620,11 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
                  * case and the property name is the last segment here).  The
                  * opcode test is what makes it precise: the pending line is only
                  * consumed when the value just parsed really was a class. */
-                js_report_symbol(s, JS_SYMBOL_CLASS, name, JS_ATOM_NULL,
-                                 JS_ATOM_NULL, NULL, s->pending_class_line);
+                js_report_symbol_full(s, JS_SYMBOL_CLASS, name, JS_ATOM_NULL,
+                                      JS_ATOM_NULL, NULL, s->pending_class_line, 0,
+                                      s->pending_class_doc);
+                js_free(s->ctx, s->pending_class_doc);
+                s->pending_class_doc = NULL;
                 s->pending_class_line = -1;
             }
         } else {
@@ -38360,6 +38579,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     bool has_opt_arg;
     bool create_func_var = false;
     bool report_top = false;    /* Bintana patch: see where it is set */
+    char *top_doc = NULL;       /* ...and the documentation it carries */
 
     /*
      * Bintana patch: `async` is refused where it is written.
@@ -38496,11 +38716,13 @@ static __exception int js_parse_function_decl2(JSParseState *s,
      * of this function's to say.  The first version reported here, and handed
      * over whatever the previous function had left in a shared buffer. */
     report_top = (func_type == JS_PARSE_FUNC_STATEMENT && fd->parent == NULL);
+    top_doc = report_top ? js_take_doc(s, function_line_num) : NULL;
 
     fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
                              function_line_num, function_col_num);
     if (!fd) {
         JS_FreeAtom(ctx, func_name);
+        js_free(ctx, top_doc);
         return -1;
     }
     if (pfd)
@@ -38740,10 +38962,13 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     /* Bintana patch: the parameters are read and the body is not, so this is
      * the one moment the report is both complete and early. */
     if (report_top) {
-        js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
-                         JS_ATOM_NULL, fd->params_buf, function_line_num);
+        js_report_symbol_full(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
+                              JS_ATOM_NULL, fd->params_buf, function_line_num,
+                              0, top_doc);
         report_top = false;
     }
+    js_free(ctx, top_doc);
+    top_doc = NULL;
 
     if (fd->has_parameter_expressions) {
         int idx;
@@ -39011,8 +39236,10 @@ done:
      * declaration, with what was read of the list -- the property the early
      * report existed for, since a half-typed file is the ordinary state. */
     if (report_top)
-        js_report_symbol(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
-                         JS_ATOM_NULL, fd->params_buf, function_line_num);
+        js_report_symbol_full(s, JS_SYMBOL_FUNCTION, func_name, JS_ATOM_NULL,
+                              JS_ATOM_NULL, fd->params_buf, function_line_num,
+                              0, top_doc);
+    js_free(ctx, top_doc);
     /* ...and a function that broke is a scope up to where it broke, which is
      * where somebody is typing: the cursor is inside it. */
     if (fd && fd->parent)
@@ -39278,6 +39505,12 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     fd->body_scope = fd->scope_level;
 
     err = js_parse_program(s);
+    /* Bintana patch: an anonymous class that no assignment named keeps the
+     * documentation it took; nothing reports it after the parse. */
+    js_free(ctx, s->pending_class_doc);
+    s->pending_class_doc = NULL;
+    JS_FreeAtom(ctx, s->literal_owner);
+    s->literal_owner = JS_ATOM_NULL;
     if (err) {
     fail:
         free_token(s, &s->token);

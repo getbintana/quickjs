@@ -1,8 +1,8 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the eleven
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the twelve
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Eleven patch commits plus this file, on top of `v0.17.0`, and one upstream fix
+**Twelve patch commits plus this file, on top of `v0.17.0`, and one upstream fix
 taken early (below).** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
@@ -21,6 +21,7 @@ those assertions are the only thing that would say so.
 | 9 | `Report every scope and every declared variable to the embedder` | `JS_SYMBOL_VARIABLE` (each `let`/`const`/`var`, `catch` binding, destructured name and `for...of` variable, at its line -- reported in `js_define_var`, which all four declaration paths go through) and `JS_SYMBOL_SCOPE` (every function, anonymous ones included, with its parameters and the lines it spans: the handler gained an `end_line`). A function that fails to parse is a scope up to where it broke, which is where somebody is typing. It is what lets an editor offer the parameters and locals in scope at the cursor. |
 | 10 | `Report each declaration's JSDoc comment to the embedder` | The lexer keeps the last comment that opens with two stars (and where it ended); a class, a member and a top-level function take it when it ends on the line before them or on their own, **with nothing but words, dots, `=` and space in between** -- the line alone let a comment at the end of one method's body document the next. Taken where the declaration's name is read, since a member is reported after its body. The handler gains a `doc`: the text between the delimiters, nothing else done to it. **And `JS_SYMBOL_ASSIGNED`**: a function assigned at the top level (`File.LoadJson = function (path) {}`, `Widget.prototype.Dump = ...`), named by its target as written, with its parameters and its doc -- which is how a runtime adds to a class it did not declare, and the shape most of `rad.js` and `forms.js` are written in. The doc is looked at where the target starts and not taken: a class on the right takes it itself, and by the time a function on the right is read the last comment is one inside its body. **An object literal on the right reports each function it holds** as assigned to `<target>.<name>` (`GLOBAL.Settings.Get`), through `literal_owner`, which the literal takes so a literal nested in it owns nothing; a getter is reported with no parameters and a setter not at all. |
 | 11 | `Close a full rope leaf like a binary counter, not under a new root` | `js_rope_push`, called from `JS_ConcatString` when the open leaf of a rope is full: the closed leaf joins the subtree on its left while the two are the same depth, so repeated `s += x` keeps the rope near 2 log2(leaves) deep and never reaches the rebalance at `JS_STRING_ROPE_MAX_DEPTH`. Before, every closed leaf went under a new root and the rope was rebalanced -- every leaf walked -- every few dozen leaves, which made a long append quadratic: Gambas's `string2` (26 million appends, 104 MB) went 34.8 s -> 3.9 s. `tests/test_rope_append.js` holds both the text and the linearity. |
+| 12 | `Search a narrow string with memchr and memcmp` | `string_cmp` compares two narrow strings with `memcmp`, `string_indexof_char` finds a byte with `memchr`, and `String.prototype.indexOf` (forwards) and `includes` go through `string_indexof` instead of comparing the needle at every position. A search that finds nothing over 4 MB went 1343 -> 16 ms; Gambas's `string1` 10.3 -> 5.5 s. Wide strings keep the loops. `tests/test_string_search.js` holds seven searches to a reference written in JavaScript over 4000 random cases. |
 
 ## Taken from upstream before a release
 
@@ -57,5 +58,5 @@ the build:
 
     ./tests/run.sh widgets
 
-Patches 2, 3 and 11 are ordinary fixes and are candidates to send upstream; the
+Patches 2, 3, 11 and 12 are ordinary fixes and are candidates to send upstream; the
 rest are Bintana's own and are not.

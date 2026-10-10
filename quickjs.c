@@ -48587,6 +48587,10 @@ slow_path:
 static int string_cmp(JSString *p1, JSString *p2, int x1, int x2, int len)
 {
     int i, c1, c2;
+    /* Bintana patch: two narrow strings compare as bytes.  Every caller
+       asks only whether the answer is zero. */
+    if (!p1->is_wide_char && !p2->is_wide_char)
+        return memcmp(str8(p1) + x1, str8(p2) + x2, len);
     for (i = 0; i < len; i++) {
         if ((c1 = string_get(p1, x1 + i)) != (c2 = string_get(p2, x2 + i)))
             return c1 - c2;
@@ -48604,11 +48608,13 @@ static int string_indexof_char(JSString *p, int c, int from)
                 return i;
         }
     } else {
-        if ((c & ~0xff) == 0) {
-            for (i = from; i < len; i++) {
-                if (str8(p)[i] == (uint8_t)c)
-                    return i;
-            }
+        /* Bintana patch: memchr, which the C library vectorises, and not a
+           byte at a time -- a search that finds nothing walks the whole
+           string. */
+        if ((c & ~0xff) == 0 && from < len) {
+            const uint8_t *q = memchr(str8(p) + from, c, len - from);
+            if (q)
+                return q - str8(p);
         }
     }
     return -1;
@@ -48762,7 +48768,12 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
         inc = 1;
     }
     ret = -1;
-    if (len >= v_len && inc * (stop - start) >= 0) {
+    /* Bintana patch: forwards, the search that skips from one occurrence of
+       the first character to the next, and not a comparison at every
+       position. */
+    if (inc > 0) {
+        ret = string_indexof(p, p1, start);
+    } else if (len >= v_len && inc * (stop - start) >= 0) {
         for (i = start;; i += inc) {
             if (!string_cmp(p, p1, i, 0, v_len)) {
                 ret = i;
@@ -48817,8 +48828,9 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
     len -= v_len;
     ret = 0;
     if (magic == 0) {
-        start = pos;
-        stop = len;
+        /* Bintana patch: the same search as indexOf. */
+        ret = string_indexof(p, p1, pos) >= 0;
+        goto done;
     } else {
         if (magic == 1) {
             if (pos > len)

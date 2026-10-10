@@ -5513,6 +5513,46 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
     return ret;
 }
 
+/* Bintana patch: appending to a long string must not rebalance it.
+
+   Repeated `s += x` closes a leaf every JS_STRING_ROPE_SHORT_LEN characters
+   and used to hang it under a new root, one level deeper each time, so the
+   rope reached JS_STRING_ROPE_MAX_DEPTH every few dozen leaves and was
+   rebalanced -- a walk over every leaf so far.  The total was quadratic:
+   2731 ms for 32 MB appended four characters at a time, against 521 ms for
+   the same work with no rebalancing.
+
+   A closed piece is pushed like a binary counter: it joins the subtree on its
+   left when the two are the same depth, and the join carries on leftwards.
+   The rope on the left of the open leaf is then a chain of perfect subtrees of
+   decreasing depth, so the depth stays near 2 log2(leaves) -- 42 at the
+   longest string the engine allows -- and the rebalance is never reached.
+   Consumes `a` and `b`. */
+static int js_rope_depth(JSValueConst v)
+{
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE)
+        return JS_VALUE_GET_STRING_ROPE(v)->depth;
+    return 0;
+}
+
+static JSValue js_rope_push(JSContext *ctx, JSValue a, JSValue b)
+{
+    if (JS_VALUE_GET_TAG(a) == JS_TAG_STRING_ROPE) {
+        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(a);
+        if (js_rope_depth(r->right) == js_rope_depth(b)) {
+            JSValue left = js_dup(r->left);
+            JSValue joined = js_new_string_rope(ctx, js_dup(r->right), b);
+            JS_FreeValue(ctx, a);
+            if (JS_IsException(joined)) {
+                JS_FreeValue(ctx, left);
+                return JS_EXCEPTION;
+            }
+            return js_rope_push(ctx, left, joined);
+        }
+    }
+    return js_new_string_rope(ctx, a, b);
+}
+
 /* op1 and op2 are converted to strings. For convenience, op1 or op2 =
    JS_EXCEPTION are accepted and return JS_EXCEPTION.  */
 static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
@@ -5564,6 +5604,23 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
                     JS_FreeValue(ctx, op1);
                     return ret;
                 }
+            }
+        }
+        /* Bintana patch: the open leaf is full (or op2 is not short), so it
+           is closed into the counter and op2 starts the next one. */
+        if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING_ROPE) {
+            JSStringRope *r1 = JS_VALUE_GET_STRING_ROPE(op1);
+            if (JS_VALUE_GET_TAG(r1->right) == JS_TAG_STRING) {
+                JSValue sealed = js_rope_push(ctx, js_dup(r1->left),
+                                              js_dup(r1->right));
+                JS_FreeValue(ctx, op1);
+                if (JS_IsException(sealed)) {
+                    JS_FreeValue(ctx, op2);
+                    return JS_EXCEPTION;
+                }
+                if (p2->len <= JS_STRING_ROPE_SHORT_LEN)
+                    return js_new_string_rope(ctx, sealed, op2);
+                return js_rope_push(ctx, sealed, op2);
             }
         }
     } else if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING) {

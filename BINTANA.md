@@ -1,8 +1,9 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the seven
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the ten
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Seven patch commits plus this file, on top of `v0.17.0`.** Every patch is marked
+**Ten patch commits plus this file, on top of `v0.17.0`, and one upstream fix
+taken early (below).** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
 those assertions are the only thing that would say so.
@@ -19,6 +20,16 @@ those assertions are the only thing that would say so.
 | 8 | `Report a member's parameters and its kind to the embedder` | `JS_SYMBOL_STATIC` / `_GETTER` / `_SETTER` beside `JS_SYMBOL_METHOD`, and a `params` on every method: the list in the spelling a declaration uses. The three kinds all reach `js_parse_class` as a method of the same name, and the parameters are the one place they exist -- the function object keeps the count and discards the names. `Function.length` is a lower bound the moment a parameter has a default, so a host that never ran the file has a weaker answer and a host that did has no answer at all. **The list is kept on each `JSFunctionDef`, not on the parse state**: a method is reported after its body, and a shared buffer handed over the last nested function's parameters (`Ask(message, options)` with an arrow inside came out `(x,y,z)`), while a top-level function was reported before its own list was read. A `static` accessor is `JS_SYMBOL_STATIC_GETTER`/`_SETTER`. |
 | 9 | `Report every scope and every declared variable to the embedder` | `JS_SYMBOL_VARIABLE` (each `let`/`const`/`var`, `catch` binding, destructured name and `for...of` variable, at its line -- reported in `js_define_var`, which all four declaration paths go through) and `JS_SYMBOL_SCOPE` (every function, anonymous ones included, with its parameters and the lines it spans: the handler gained an `end_line`). A function that fails to parse is a scope up to where it broke, which is where somebody is typing. It is what lets an editor offer the parameters and locals in scope at the cursor. |
 | 10 | `Report each declaration's JSDoc comment to the embedder` | The lexer keeps the last comment that opens with two stars (and where it ended); a class, a member and a top-level function take it when it ends on the line before them or on their own, **with nothing but words, dots, `=` and space in between** -- the line alone let a comment at the end of one method's body document the next. Taken where the declaration's name is read, since a member is reported after its body. The handler gains a `doc`: the text between the delimiters, nothing else done to it. **And `JS_SYMBOL_ASSIGNED`**: a function assigned at the top level (`File.LoadJson = function (path) {}`, `Widget.prototype.Dump = ...`), named by its target as written, with its parameters and its doc -- which is how a runtime adds to a class it did not declare, and the shape most of `rad.js` and `forms.js` are written in. The doc is looked at where the target starts and not taken: a class on the right takes it itself, and by the time a function on the right is read the last comment is one inside its body. **An object literal on the right reports each function it holds** as assigned to `<target>.<name>` (`GLOBAL.Settings.Get`), through `literal_owner`, which the literal takes so a literal nested in it owns nothing; a getter is reported with no parameters and a setter not at all. |
+
+## Taken from upstream before a release
+
+| Upstream | Why it could not wait |
+|---|---|
+| `2f0aa72` *Port bellard/quickjs@10c81b1 to fix GCC 14+ performance regression* | `JS_MKVAL` wrote half of a 16-byte `JSValue`, and GCC 14 and later turn every `js_int32`/`js_bool` inlined into `JS_CallInternal` into a read-modify-write through the stack. Measured on GCC 16, Release, against the tree without it: a tight integer loop **1650 -> 580 ms**, property reads **1092 -> 570 ms**. It touches `quickjs.h` only and none of the patches above. |
+
+A cherry-pick (`-x`, so it names its upstream commit) and not a patch: the
+release that contains it makes it disappear from this branch at the next
+rebase, which is the whole of what to do about it.
 
 ## Rebasing on a new upstream release
 

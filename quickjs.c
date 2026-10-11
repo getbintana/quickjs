@@ -23758,6 +23758,24 @@ static __exception int ident_realloc(JSContext *ctx, char **pbuf, size_t *psize,
 #ifndef QJS_DISABLE_PARSER
 
 /* convert a TOK_IDENT to a keyword when needed */
+/*
+ * Bintana patch: `await` and `import()` are refused where they are written,
+ * the thirteenth patch and the fifth's other half.  This runtime registers the
+ * async classes now (a module is evaluated through a promise, so it has to) and
+ * still has no `Promise` in the language: nothing a program writes may wait on
+ * one or be handed one.  With patch 5 refusing every async function, the only
+ * function whose kind is still JS_FUNC_ASYNC is a module's body, so a module's
+ * top-level `await` -- an expression, `for await` or `await using` -- is the
+ * whole of what this guard meets; and `import()` answers a promise wherever it
+ * is written.  Refused in the parser and not at run time so that a source
+ * checker sees it, with the column of the word.
+ */
+static int js_refuse_await(JSParseState *s)
+{
+    return js_parse_error(s, "await is not available: there is no Promise "
+                             "here to wait on");
+}
+
 static void update_token_ident(JSParseState *s)
 {
     /* `using` is contextually reserved, not a true keyword. Leave it as
@@ -28475,6 +28493,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         }
         break;
     case TOK_IMPORT:
+        /* Bintana patch 13: see js_refuse_await. */
+        if (peek_token(s, false) == '(')
+            return js_parse_error(s, "import() is not available: it answers a "
+                                     "Promise, and there is none here");
         if (next_token(s))
             return -1;
         if (s->token.val == '.') {
@@ -29063,6 +29085,7 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
     case TOK_AWAIT:
         if (!(s->cur_func->func_kind & JS_FUNC_ASYNC))
             return js_parse_error(s, "unexpected 'await' keyword");
+        return js_refuse_await(s);   /* Bintana patch 13 */
         if (!s->cur_func->in_function_body)
             return js_parse_error(s, "await in default expression");
         if (next_token(s))
@@ -30334,6 +30357,8 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
         return -1;
     }
     bool is_await_using = false;
+    if (tok == TOK_AWAIT)
+        return js_refuse_await(s);   /* Bintana patch 13: `for (await using` */
     if (tok == TOK_AWAIT) {
         int u;
         if (next_token(s))
@@ -30706,6 +30731,11 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             goto fail;
         break;
     case TOK_AWAIT:
+        /* Bintana patch 13: `await using` and `await x;` alike. */
+        if (s->cur_func->func_kind & JS_FUNC_ASYNC) {
+            js_refuse_await(s);
+            goto fail;
+        }
         /* Check for 'await using' declaration */
         if (s->cur_func->func_kind & JS_FUNC_ASYNC) {
             JSParsePos pos;
@@ -30879,6 +30909,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     js_parse_error(s, "for await is only valid in asynchronous functions");
                     goto fail;
                 }
+                js_refuse_await(s);   /* Bintana patch 13 */
+                goto fail;
                 is_async = true;
                 if (next_token(s))
                     goto fail;
@@ -30919,6 +30951,11 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                         goto fail;
                     if (u)
                         tok = TOK_USING;
+                }
+                if (tok == TOK_AWAIT &&
+                    (s->cur_func->func_kind & JS_FUNC_ASYNC)) {
+                    js_refuse_await(s);   /* Bintana patch 13 */
+                    goto fail;
                 }
                 if (tok == TOK_AWAIT &&
                     (s->cur_func->func_kind & JS_FUNC_ASYNC)) {

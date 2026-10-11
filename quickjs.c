@@ -8530,6 +8530,44 @@ static JSFunctionBytecode *bta_frame_bytecode(JSStackFrame *sf)
 }
 
 /*
+ * Bintana patch: a name the function reaches from outside itself -- a closure
+ * variable: what an enclosing function declared, and in a module every
+ * top-level name the module keeps to itself.  The value is read through the
+ * function object's `var_refs`, the indirection the interpreter uses for it.
+ * Answers false for a slot the function has not got and for a name a
+ * parameter list cannot take: the engine's own (`this` of an arrow,
+ * `new.target`, the `<...>` ones), which are not something the program wrote.
+ */
+static bool bta_closure_at(JSContext *ctx, JSStackFrame *sf,
+                           JSFunctionBytecode *b, int k, JSValue *value)
+{
+    JSObject   *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    JSAtom      atom = b->closure_var[k].var_name;
+    const char *name;
+    bool        plain = true;
+    int         i;
+
+    if (atom == JS_ATOM_NULL || atom == JS_ATOM_this ||
+        !p->u.func.var_refs || !p->u.func.var_refs[k])
+        return false;
+    name = JS_AtomToCString(ctx, atom);
+    if (!name)
+        return false;
+    for (i = 0; name[i]; i++) {
+        char c = name[i];
+        if (!(c == '_' || c == '$' || (c >= 'a' && c <= 'z') ||
+              (c >= 'A' && c <= 'Z') || (i && c >= '0' && c <= '9') ||
+              (unsigned char)c >= 0x80))
+            plain = false;
+    }
+    JS_FreeCString(ctx, name);
+    if (!plain || !i)
+        return false;
+    *value = *p->u.func.var_refs[k]->pvalue;
+    return true;
+}
+
+/*
  * Where frame 0 is.
  *
  * The topmost frame that is running *code*, which is not always the topmost
@@ -8617,6 +8655,10 @@ static void bta_lines_of(JSContext *ctx, JSValueConst func, JSValue out,
     unsigned int        op;
     int                 i;
 
+    /* Bintana patch: a module record is its body's bytecode for this purpose
+     * -- what an embedder compiles a module file to and shows a debugger. */
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_MODULE)
+        func = ((JSModuleDef *)JS_VALUE_GET_PTR(func))->func_obj;
     if (JS_VALUE_GET_TAG(func) != JS_TAG_FUNCTION_BYTECODE &&
         JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
         return;
@@ -8806,6 +8848,34 @@ JSValue JS_DebugLocals(JSContext *ctx, int index)
         JS_SetPropertyUint32(ctx, out, n++, row);
     }
 
+    /* Bintana patch: and what it reaches from outside itself, marked so --
+     * a module's private names are all of this kind. A name the frame
+     * declares itself hides the outer one, as it does in the code. */
+    for (i = 0; i < b->closure_var_count; i++) {
+        JSAtom      atom = b->closure_var[i].var_name;
+        JSValue     value, row;
+        const char *name;
+        bool        hidden = false;
+        int         k;
+
+        if (!bta_closure_at(ctx, sf, b, i, &value) ||
+            JS_VALUE_GET_TAG(value) == JS_TAG_UNINITIALIZED)
+            continue;
+        for (k = 0; k < b->arg_count + b->var_count && !hidden; k++)
+            hidden = b->vardefs[k].var_name == atom;
+        if (hidden)
+            continue;
+
+        row  = JS_NewObject(ctx);
+        name = JS_AtomToCString(ctx, atom);
+        JS_SetPropertyStr(ctx, row, "Name", JS_NewString(ctx, name ? name : "?"));
+        JS_FreeCString(ctx, name);
+        JS_SetPropertyStr(ctx, row, "Value", js_dup(value));
+        JS_SetPropertyStr(ctx, row, "Argument", JS_FALSE);
+        JS_SetPropertyStr(ctx, row, "Closure", JS_TRUE);
+        JS_SetPropertyUint32(ctx, out, n++, row);
+    }
+
     {
         JSValue row = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, row, "Name", JS_NewString(ctx, "this"));
@@ -8874,7 +8944,8 @@ JSValue JS_DebugEval(JSContext *ctx, int index, const char *expr)
     js_dbuf_init(ctx, &src);
     dbuf_putstr(&src, "(function(");
 
-    seen = js_malloc(ctx, sizeof(*seen) * (b->arg_count + b->var_count + 1));
+    seen = js_malloc(ctx, sizeof(*seen) *
+                          (b->arg_count + b->var_count + b->closure_var_count + 1));
     if (!seen) {
         dbuf_free(&src);
         return JS_EXCEPTION;
@@ -8908,6 +8979,31 @@ JSValue JS_DebugEval(JSContext *ctx, int index, const char *expr)
         seen[n++] = vd->var_name;
     }
 
+    /* Bintana patch: the names it reaches from outside, after its own, so
+     * an own name hides an outer one of the same spelling as in the code. */
+    for (i = 0; i < b->closure_var_count; i++) {
+        JSAtom      atom = b->closure_var[i].var_name;
+        JSValue     v;
+        const char *name;
+        int         k;
+        bool        dup = false;
+
+        if (!bta_closure_at(ctx, sf, b, i, &v))
+            continue;
+        for (k = 0; k < n && !dup; k++)
+            dup = seen[k] == atom;
+        if (dup)
+            continue;
+        name = JS_AtomToCString(ctx, atom);
+        if (!name)
+            continue;
+        if (n)
+            dbuf_putc(&src, ',');
+        dbuf_putstr(&src, name);
+        JS_FreeCString(ctx, name);
+        seen[n++] = atom;
+    }
+
     dbuf_putstr(&src, "){return (");
     dbuf_putstr(&src, expr);
     dbuf_putstr(&src, ");})");
@@ -8922,6 +9018,7 @@ JSValue JS_DebugEval(JSContext *ctx, int index, const char *expr)
         return fn;
     }
 
+    int nparams = n;   /* Bintana patch: own names and outer ones */
     argv = js_malloc(ctx, sizeof(*argv) * (n > 0 ? n : 1));
     if (!argv) {
         js_free(ctx, seen);
@@ -8961,6 +9058,26 @@ JSValue JS_DebugEval(JSContext *ctx, int index, const char *expr)
 
         argv[n] = js_dup(v);
         seen[n] = vd->var_name;
+        n++;
+    }
+
+    /* Bintana patch: the outer names' values, in the order written above. */
+    for (i = 0; i < b->closure_var_count && n < nparams; i++) {
+        JSAtom  atom = b->closure_var[i].var_name;
+        JSValue v;
+        int     k;
+        bool    dup = false;
+
+        if (!bta_closure_at(ctx, sf, b, i, &v))
+            continue;
+        for (k = 0; k < n && !dup; k++)
+            dup = seen[k] == atom;
+        if (dup)
+            continue;
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED)
+            v = JS_UNDEFINED;
+        argv[n] = js_dup(v);
+        seen[n] = atom;
         n++;
     }
 

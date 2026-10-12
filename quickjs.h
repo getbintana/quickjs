@@ -1413,6 +1413,14 @@ JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
 JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
 JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
 JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
+/* Bintana patch: discard a module compiled with JS_EVAL_FLAG_COMPILE_ONLY that
+   was never linked.  Without it such a record lives as long as the context --
+   JS_FreeValue never frees a module -- so an editor that compiles a module's
+   text to check it keeps every compile.  A module that has been linked or
+   evaluated belongs to the context and is left alone; so is anything that is
+   not a module, which is freed as JS_FreeValue would.  The caller promises
+   that nothing imports it. */
+JS_EXTERN void JS_FreeUnevaluatedModule(JSContext *ctx, JSValue val);
 
 /* associate a JSValue to a C module */
 JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);

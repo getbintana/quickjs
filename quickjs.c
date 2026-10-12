@@ -32707,6 +32707,23 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
     return JS_EXCEPTION;
 }
 
+/* Bintana patch: see quickjs.h.  A compile-only module is resolved (its
+   requests are loaded) and unlinked; nothing has made var_refs or a namespace
+   for it yet, so js_free_module_def is the whole of undoing it. */
+void JS_FreeUnevaluatedModule(JSContext *ctx, JSValue val)
+{
+    JSModuleDef *m;
+
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_MODULE) {
+        JS_FreeValue(ctx, val);
+        return;
+    }
+    m = JS_VALUE_GET_PTR(val);
+    if (m->status != JS_MODULE_STATUS_UNLINKED)
+        return;
+    js_free_module_def(ctx, m);
+}
+
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 {
     if (JS_IsUndefined(m->module_ns)) {

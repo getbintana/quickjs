@@ -1451,6 +1451,19 @@ JS_EXTERN void JS_EnumFreeNames(JSContext *ctx, JSValueConst compiled,
    both atoms are the caller's to free. */
 JS_EXTERN JSAtom JS_GetExportOrigin(JSContext *ctx, JSModuleDef *m,
                                     JSAtom export_name, JSAtom *local_name);
+/* Bintana patch: the names a compiled module declares at its own top level --
+   what it may keep to itself, exported or not -- reported through the handler
+   of JS_EnumFreeNames with line 0.  Nothing for a script, whose top level is
+   the global scope's, nor for an import, which is another module's binding. */
+JS_EXTERN void JS_EnumModuleDeclarations(JSContext *ctx, JSValueConst compiled,
+                                         JSFreeNameHandler *cb, void *opaque);
+/* Bintana patch: JS_EnumFreeNames with a choice.  JS_FREE_NAMES_SKIP_TYPEOF
+   leaves out a `typeof X` -- the one read that asks whether a name exists
+   rather than needing it to. */
+#define JS_FREE_NAMES_SKIP_TYPEOF 1
+JS_EXTERN void JS_EnumFreeNamesFlags(JSContext *ctx, JSValueConst compiled,
+                                     int flags, JSFreeNameHandler *cb,
+                                     void *opaque);
 
 /* associate a JSValue to a C module */
 JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);

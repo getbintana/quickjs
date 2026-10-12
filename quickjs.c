@@ -32724,6 +32724,36 @@ void JS_FreeUnevaluatedModule(JSContext *ctx, JSValue val)
     js_free_module_def(ctx, m);
 }
 
+/* Bintana patch: see quickjs.h.  A module's top-level declarations are the
+   closure variables of its body that the module itself creates
+   (JS_CLOSURE_MODULE_DECL); an import is a closure variable of another kind,
+   and the engine's own bindings (`*default*`) are spelled so that no
+   identifier can be. */
+void JS_EnumModuleDeclarations(JSContext *ctx, JSValueConst compiled,
+                               JSFreeNameHandler *cb, void *opaque)
+{
+    JSFunctionBytecode *b;
+    JSModuleDef        *m;
+    int                 i;
+
+    if (JS_VALUE_GET_TAG(compiled) != JS_TAG_MODULE)
+        return;
+    m = JS_VALUE_GET_PTR(compiled);
+    if (JS_VALUE_GET_TAG(m->func_obj) == JS_TAG_FUNCTION_BYTECODE)
+        b = JS_VALUE_GET_PTR(m->func_obj);
+    else if (JS_VALUE_GET_TAG(m->func_obj) == JS_TAG_OBJECT &&
+             js_class_has_bytecode(JS_VALUE_GET_OBJ(m->func_obj)->class_id))
+        b = JS_VALUE_GET_OBJ(m->func_obj)->u.func.function_bytecode;
+    else
+        return;
+    for (i = 0; b && i < b->closure_var_count; i++) {
+        JSClosureVar *cv = &b->closure_var[i];
+        if (cv->closure_type == JS_CLOSURE_MODULE_DECL &&
+            cv->var_name != JS_ATOM__default_)
+            cb(ctx, cv->var_name, 0, opaque);
+    }
+}
+
 /* Bintana patch: see quickjs.h.  The engine's own resolution, which follows
    `export { x } from`, `export *` and their chains to the local export entry;
    an `export * as ns from` resolves to the module it names, whose namespace is
@@ -32758,7 +32788,8 @@ JSAtom JS_GetExportOrigin(JSContext *ctx, JSModuleDef *m, JSAtom export_name,
    the `with_*` forms resolve at run time against an object and are not a
    global's either. */
 static void bta_free_names_of(JSContext *ctx, JSValueConst func,
-                              JSFreeNameHandler *cb, void *opaque)
+                              JSFreeNameHandler *cb, void *opaque,
+                              int flags)
 {
     JSFunctionBytecode *b;
     JSObject           *p;
@@ -32781,6 +32812,8 @@ static void bta_free_names_of(JSContext *ctx, JSValueConst func,
 
     for (pos = 0; pos < b->byte_code_len; pos += short_opcode_info(op).size) {
         op = b->byte_code_buf[pos];
+        if (op == OP_get_var_undef && (flags & JS_FREE_NAMES_SKIP_TYPEOF))
+            continue;
         switch (op) {
         case OP_get_var_undef:
         case OP_get_var:
@@ -32796,13 +32829,20 @@ static void bta_free_names_of(JSContext *ctx, JSValueConst func,
     }
 
     for (i = 0; i < b->cpool_count; i++)
-        bta_free_names_of(ctx, b->cpool[i], cb, opaque);
+        bta_free_names_of(ctx, b->cpool[i], cb, opaque, flags);
 }
 
 void JS_EnumFreeNames(JSContext *ctx, JSValueConst compiled,
                       JSFreeNameHandler *cb, void *opaque)
 {
-    bta_free_names_of(ctx, compiled, cb, opaque);
+    bta_free_names_of(ctx, compiled, cb, opaque, 0);
+}
+
+/* Bintana patch: see quickjs.h (patch 18). */
+void JS_EnumFreeNamesFlags(JSContext *ctx, JSValueConst compiled, int flags,
+                           JSFreeNameHandler *cb, void *opaque)
+{
+    bta_free_names_of(ctx, compiled, cb, opaque, flags);
 }
 
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)

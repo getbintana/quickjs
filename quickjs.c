@@ -32724,6 +32724,62 @@ void JS_FreeUnevaluatedModule(JSContext *ctx, JSValue val)
     js_free_module_def(ctx, m);
 }
 
+/* Bintana patch: see quickjs.h.  After the last pass every name the scope
+   analysis could not bind to a local, an argument or a closure variable is an
+   opcode carrying its atom -- the global lookups -- so the free names of a
+   compile are those opcodes, read from the final bytecode of the function and
+   of every function in its constant pool.  A declaration of a script's top
+   level (define_var, define_func, put_var_init) is not a use and is skipped;
+   the `with_*` forms resolve at run time against an object and are not a
+   global's either. */
+static void bta_free_names_of(JSContext *ctx, JSValueConst func,
+                              JSFreeNameHandler *cb, void *opaque)
+{
+    JSFunctionBytecode *b;
+    JSObject           *p;
+    int                 pos, op, col, i;
+
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_MODULE)
+        func = ((JSModuleDef *)JS_VALUE_GET_PTR(func))->func_obj;
+    if (JS_VALUE_GET_TAG(func) == JS_TAG_FUNCTION_BYTECODE) {
+        b = JS_VALUE_GET_PTR(func);
+    } else if (JS_VALUE_GET_TAG(func) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(func);
+        if (!js_class_has_bytecode(p->class_id))
+            return;
+        b = p->u.func.function_bytecode;
+    } else {
+        return;
+    }
+    if (!b)
+        return;
+
+    for (pos = 0; pos < b->byte_code_len; pos += short_opcode_info(op).size) {
+        op = b->byte_code_buf[pos];
+        switch (op) {
+        case OP_get_var_undef:
+        case OP_get_var:
+        case OP_put_var:
+        case OP_delete_var:
+        case OP_make_var_ref:
+            cb(ctx, get_u32(b->byte_code_buf + pos + 1),
+               find_line_num(ctx, b, pos, &col), opaque);
+            break;
+        default:
+            break;
+        }
+    }
+
+    for (i = 0; i < b->cpool_count; i++)
+        bta_free_names_of(ctx, b->cpool[i], cb, opaque);
+}
+
+void JS_EnumFreeNames(JSContext *ctx, JSValueConst compiled,
+                      JSFreeNameHandler *cb, void *opaque)
+{
+    bta_free_names_of(ctx, compiled, cb, opaque);
+}
+
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 {
     if (JS_IsUndefined(m->module_ns)) {

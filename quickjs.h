@@ -1433,6 +1433,17 @@ JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
    not a module, which is freed as JS_FreeValue would.  The caller promises
    that nothing imports it. */
 JS_EXTERN void JS_FreeUnevaluatedModule(JSContext *ctx, JSValue val);
+/* Bintana patch: the free names a compile uses -- every name its code looks
+   up in the global scope because nothing in the file binds it -- each with the
+   line it is used on, once per use, in no particular order.  `compiled` is what
+   JS_Eval with JS_EVAL_FLAG_COMPILE_ONLY handed back, a script's function or a
+   module.  A name the file declares at its own top level is free in a script
+   (a script's top level is the global scope) and bound in a module; an
+   imported name is bound.  The atom is borrowed for the length of the call. */
+typedef void JSFreeNameHandler(JSContext *ctx, JSAtom name, int line,
+                               void *opaque);
+JS_EXTERN void JS_EnumFreeNames(JSContext *ctx, JSValueConst compiled,
+                                JSFreeNameHandler *cb, void *opaque);
 
 /* associate a JSValue to a C module */
 JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);

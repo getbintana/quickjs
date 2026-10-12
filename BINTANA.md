@@ -1,8 +1,8 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the seventeen
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the eighteen
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Seventeen patches, one commit each (the fourth has a second), plus this file, on top of `v0.17.0`, and one upstream fix
+**Eighteen patches, one commit each (the fourth has a second), plus this file, on top of `v0.17.0`, and one upstream fix
 taken early (below).** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
@@ -27,6 +27,7 @@ those assertions are the only thing that would say so.
 | 15 | `Report what a module exports and imports` | `JS_SYMBOL_EXPORT` and `JS_SYMBOL_IMPORT` for the symbol handler of patches 6-10, reported by `js_report_module_entries` after each `export` or `import` statement parses, from the three tables every spelling ends in (export entries, star exports, import entries), at the line of the keyword. An export is its exported name, the local name it stands for and, for a re-export, the specifier; an import is its local name, the name it imports and the specifier. The handler's shape does not move: the specifier rides in the field a class keeps its base in. `export default <expression>` reports no local name rather than the engine's `*default*`. |
 | 16 | `Report the free names a compile uses` | `JS_EnumFreeNames`: every name a compiled script or module looks up in the global scope, with the line of each use -- read from the final bytecode (`get_var`, `get_var_undef`, `put_var`, `delete_var`, `make_var_ref`) of the function and of every function in its constant pool, since after the last pass a name nothing binds is exactly such an opcode. An imported name and a module's own top level are bound and never reported; a script's top-level declarations are not uses. It is what lets Bintana refuse at load a name two modules export that a file uses with no import. |
 | 17 | `Say which module an export's binding belongs to` | `JS_GetExportOrigin`: for an exported name of a linked module, the module whose own binding it is and that binding's local name, through `export { x } from`, `export *` and `export * as ns` -- `js_resolve_export`'s answer, made public. Bintana tells one binding handed out by several files from two bindings by it; comparing values made two `export let count = 0` one. |
+| 18 | `Report the names a module declares at its own top level` | `JS_EnumModuleDeclarations`: the closure variables a module body creates itself (`JS_CLOSURE_MODULE_DECL`) -- its top-level declarations, exported or not, imports and `*default*` left out. And `JS_EnumFreeNamesFlags`, patch 16's walk with `JS_FREE_NAMES_SKIP_TYPEOF`, which leaves a `typeof` out. Bintana refuses at load a file that uses a name another module keeps to itself, which is otherwise a ReferenceError on the day the line runs. |
 
 ## Taken from upstream before a release
 

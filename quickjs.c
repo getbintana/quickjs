@@ -34331,6 +34331,48 @@ static __exception int js_parse_import(JSParseState *s)
     return js_parse_expect_semi(s);
 }
 
+/* Bintana patch: what one `export` or `import` statement added to the module,
+   reported once it parsed -- every spelling of either ends in these three
+   tables, so reading them is one place instead of one per spelling, and a
+   statement that broke reports nothing, since its entries are half filled. */
+static void js_report_module_entries(JSParseState *s, JSModuleDef *m,
+                                     int first_export, int first_star,
+                                     int first_import, int line)
+{
+    int i;
+
+    if (!s->ctx->rt->symbol_handler)
+        return;
+    for (i = first_export; i < m->export_entries_count; i++) {
+        JSExportEntry *me = &m->export_entries[i];
+        JSAtom from = me->export_type == JS_EXPORT_TYPE_INDIRECT
+            ? m->req_module_entries[me->u.req_module_idx].module_name
+            : JS_ATOM_NULL;
+        /* `export default <expression>` stands for the engine's own
+           `*default*` binding, which is no name a file wrote. */
+        js_report_symbol(s, JS_SYMBOL_EXPORT, me->export_name,
+                         me->local_name == JS_ATOM__default_ ? JS_ATOM_NULL
+                                                              : me->local_name,
+                         from, NULL, line);
+    }
+    for (i = first_star; i < m->star_export_entries_count; i++)
+        js_report_symbol(s, JS_SYMBOL_EXPORT, JS_ATOM__star_, JS_ATOM__star_,
+                         m->req_module_entries[m->star_export_entries[i].req_module_idx].module_name,
+                         NULL, line);
+    for (i = first_import; i < m->import_entries_count; i++) {
+        JSImportEntry *mi = &m->import_entries[i];
+        JSFunctionDef *fd = s->cur_func;
+        /* The local name lives on the closure variable add_import made, and
+           var_idx is its index. */
+        JSAtom local = mi->var_idx < fd->closure_var_count
+            ? fd->closure_var[mi->var_idx].var_name : JS_ATOM_NULL;
+
+        js_report_symbol(s, JS_SYMBOL_IMPORT, local, mi->import_name,
+                         m->req_module_entries[mi->req_module_idx].module_name,
+                         NULL, line);
+    }
+}
+
 static __exception int js_parse_source_element(JSParseState *s)
 {
     JSFunctionDef *fd = s->cur_func;
@@ -34346,14 +34388,24 @@ static __exception int js_parse_source_element(JSParseState *s)
                                    s->token.col_num))
             return -1;
     } else if (s->token.val == TOK_EXPORT && fd->module) {
+        JSModuleDef *m = fd->module;
+        int e = m->export_entries_count, st = m->star_export_entries_count;
+        int line = s->token.line_num;
+
         if (js_parse_export(s))
             return -1;
+        js_report_module_entries(s, m, e, st, m->import_entries_count, line);
     } else if (s->token.val == TOK_IMPORT && fd->module &&
                ((tok = peek_token(s, false)) != '(' && tok != '.'))  {
+        JSModuleDef *m = fd->module;
+        int i = m->import_entries_count, line = s->token.line_num;
+
         /* the peek_token is needed to avoid confusion with ImportCall
            (dynamic import) or import.meta */
         if (js_parse_import(s))
             return -1;
+        js_report_module_entries(s, m, m->export_entries_count,
+                                 m->star_export_entries_count, i, line);
     } else {
         if (js_parse_statement_or_decl(s, DECL_MASK_ALL))
             return -1;

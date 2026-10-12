@@ -704,6 +704,18 @@ typedef enum {
      * the target as written, dots and all, and it carries its parameters and
      * its documentation like a method. */
     JS_SYMBOL_ASSIGNED,
+    /* Bintana patch: what a module says to other files.  An export is reported
+     * once per name it publishes, at the line of its `export`: `name` is the
+     * exported name (`default` for a default, `*` for an `export *`), `parent`
+     * the local name it stands for (the imported one in a re-export, `*` for
+     * `export * as ns`), and `supertype` the specifier of a re-export, "" for
+     * one of the file's own.  An import is reported once per binding, at the
+     * line of its `import`: `name` is the local name, `parent` what it imports
+     * (`default`, `*` for a namespace), `supertype` the specifier.  The fields
+     * are the ones the other kinds already have, put to the use these need,
+     * so the handler's shape does not move. */
+    JS_SYMBOL_EXPORT,
+    JS_SYMBOL_IMPORT,
 } JSSymbolKind;
 /* `supertype` is the name in an `extends` clause and is empty for everything
  * except a class, for a class that declares no `extends`, and for a class whose

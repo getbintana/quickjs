@@ -1,6 +1,6 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the fourteen
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the fifteen
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
 **Thirteen patch commits plus this file, on top of `v0.17.0`, and one upstream fix
 taken early (below).** Every patch is marked
@@ -24,6 +24,7 @@ those assertions are the only thing that would say so.
 | 12 | `Search a narrow string with memchr and memcmp` | `string_cmp` compares two narrow strings with `memcmp`, `string_indexof_char` finds a byte with `memchr`, and `String.prototype.indexOf` (forwards) and `includes` go through `string_indexof` instead of comparing the needle at every position. A search that finds nothing over 4 MB went 1343 -> 16 ms; Gambas's `string1` 10.3 -> 5.5 s. Wide strings keep the loops. `tests/test_string_search.js` holds seven searches to a reference written in JavaScript over 4000 random cases. |
 | 13 | `Refuse await and import() where they are written` | `js_refuse_await`, asked wherever the parser accepts an `await` (the expression, `for await`, and `await using` in a statement, a `for` head and a `for...of` head), and a guard that refuses `import(` at the word. Patch 5's other half: with every async function refused, a module's body is the only function still of kind `JS_FUNC_ASYNC`, so this meets a module's top-level `await` and nothing else -- `await` stays a name in a script. `import()` built a promise of an unregistered class and the process aborted at exit; with the async classes registered (a module is evaluated through a promise) it would hand the program one instead. `make test` stays 0/118, and the nine tests it now refuses all use top-level `await` or `import()`. |
 | 14 | `Free a module that was compiled and never linked` | `JS_FreeUnevaluatedModule`: `js_free_module_def` for a record still `UNLINKED`, a no-op for one the context has linked or evaluated, and `JS_FreeValue` for anything that is not a module. `JS_FreeValue` never frees a module -- a record lives until the context goes -- so an editor compiling a module's text to check it kept every compile: measured, 923 KB per check of a 136 KB module, 0.3 KB with it. |
+| 15 | `Report what a module exports and imports` | `JS_SYMBOL_EXPORT` and `JS_SYMBOL_IMPORT` for the symbol handler of patches 6-10, reported by `js_report_module_entries` after each `export` or `import` statement parses, from the three tables every spelling ends in (export entries, star exports, import entries), at the line of the keyword. An export is its exported name, the local name it stands for and, for a re-export, the specifier; an import is its local name, the name it imports and the specifier. The handler's shape does not move: the specifier rides in the field a class keeps its base in. `export default <expression>` reports no local name rather than the engine's `*default*`. |
 
 ## Taken from upstream before a release
 

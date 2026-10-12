@@ -1,8 +1,8 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the fifteen
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the sixteen
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Thirteen patch commits plus this file, on top of `v0.17.0`, and one upstream fix
+**Sixteen patches, one commit each (the fourth has a second), plus this file, on top of `v0.17.0`, and one upstream fix
 taken early (below).** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
@@ -25,6 +25,7 @@ those assertions are the only thing that would say so.
 | 13 | `Refuse await and import() where they are written` | `js_refuse_await`, asked wherever the parser accepts an `await` (the expression, `for await`, and `await using` in a statement, a `for` head and a `for...of` head), and a guard that refuses `import(` at the word. Patch 5's other half: with every async function refused, a module's body is the only function still of kind `JS_FUNC_ASYNC`, so this meets a module's top-level `await` and nothing else -- `await` stays a name in a script. `import()` built a promise of an unregistered class and the process aborted at exit; with the async classes registered (a module is evaluated through a promise) it would hand the program one instead. `make test` stays 0/118, and the nine tests it now refuses all use top-level `await` or `import()`. |
 | 14 | `Free a module that was compiled and never linked` | `JS_FreeUnevaluatedModule`: `js_free_module_def` for a record still `UNLINKED`, a no-op for one the context has linked or evaluated, and `JS_FreeValue` for anything that is not a module. `JS_FreeValue` never frees a module -- a record lives until the context goes -- so an editor compiling a module's text to check it kept every compile: measured, 923 KB per check of a 136 KB module, 0.3 KB with it. |
 | 15 | `Report what a module exports and imports` | `JS_SYMBOL_EXPORT` and `JS_SYMBOL_IMPORT` for the symbol handler of patches 6-10, reported by `js_report_module_entries` after each `export` or `import` statement parses, from the three tables every spelling ends in (export entries, star exports, import entries), at the line of the keyword. An export is its exported name, the local name it stands for and, for a re-export, the specifier; an import is its local name, the name it imports and the specifier. The handler's shape does not move: the specifier rides in the field a class keeps its base in. `export default <expression>` reports no local name rather than the engine's `*default*`. |
+| 16 | `Report the free names a compile uses` | `JS_EnumFreeNames`: every name a compiled script or module looks up in the global scope, with the line of each use -- read from the final bytecode (`get_var`, `get_var_undef`, `put_var`, `delete_var`, `make_var_ref`) of the function and of every function in its constant pool, since after the last pass a name nothing binds is exactly such an opcode. An imported name and a module's own top level are bound and never reported; a script's top-level declarations are not uses. It is what lets Bintana refuse at load a name two modules export that a file uses with no import. |
 
 ## Taken from upstream before a release
 

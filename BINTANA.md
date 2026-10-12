@@ -1,6 +1,6 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the thirteen
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the fourteen
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
 **Thirteen patch commits plus this file, on top of `v0.17.0`, and one upstream fix
 taken early (below).** Every patch is marked
@@ -23,6 +23,7 @@ those assertions are the only thing that would say so.
 | 11 | `Close a full rope leaf like a binary counter, not under a new root` | `js_rope_push`, called from `JS_ConcatString` when the open leaf of a rope is full: the closed leaf joins the subtree on its left while the two are the same depth, so repeated `s += x` keeps the rope near 2 log2(leaves) deep and never reaches the rebalance at `JS_STRING_ROPE_MAX_DEPTH`. Before, every closed leaf went under a new root and the rope was rebalanced -- every leaf walked -- every few dozen leaves, which made a long append quadratic: Gambas's `string2` (26 million appends, 104 MB) went 34.8 s -> 3.9 s. `tests/test_rope_append.js` holds both the text and the linearity. |
 | 12 | `Search a narrow string with memchr and memcmp` | `string_cmp` compares two narrow strings with `memcmp`, `string_indexof_char` finds a byte with `memchr`, and `String.prototype.indexOf` (forwards) and `includes` go through `string_indexof` instead of comparing the needle at every position. A search that finds nothing over 4 MB went 1343 -> 16 ms; Gambas's `string1` 10.3 -> 5.5 s. Wide strings keep the loops. `tests/test_string_search.js` holds seven searches to a reference written in JavaScript over 4000 random cases. |
 | 13 | `Refuse await and import() where they are written` | `js_refuse_await`, asked wherever the parser accepts an `await` (the expression, `for await`, and `await using` in a statement, a `for` head and a `for...of` head), and a guard that refuses `import(` at the word. Patch 5's other half: with every async function refused, a module's body is the only function still of kind `JS_FUNC_ASYNC`, so this meets a module's top-level `await` and nothing else -- `await` stays a name in a script. `import()` built a promise of an unregistered class and the process aborted at exit; with the async classes registered (a module is evaluated through a promise) it would hand the program one instead. `make test` stays 0/118, and the nine tests it now refuses all use top-level `await` or `import()`. |
+| 14 | `Free a module that was compiled and never linked` | `JS_FreeUnevaluatedModule`: `js_free_module_def` for a record still `UNLINKED`, a no-op for one the context has linked or evaluated, and `JS_FreeValue` for anything that is not a module. `JS_FreeValue` never frees a module -- a record lives until the context goes -- so an editor compiling a module's text to check it kept every compile: measured, 923 KB per check of a 136 KB module, 0.3 KB with it. |
 
 ## Taken from upstream before a release
 

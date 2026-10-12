@@ -32724,6 +32724,31 @@ void JS_FreeUnevaluatedModule(JSContext *ctx, JSValue val)
     js_free_module_def(ctx, m);
 }
 
+/* Bintana patch: see quickjs.h.  The engine's own resolution, which follows
+   `export { x } from`, `export *` and their chains to the local export entry;
+   an `export * as ns from` resolves to the module it names, whose namespace is
+   the binding. */
+JSAtom JS_GetExportOrigin(JSContext *ctx, JSModuleDef *m, JSAtom export_name,
+                          JSAtom *local_name)
+{
+    JSModuleDef        *res_m;
+    JSExportEntry      *res_me;
+    JSResolveResultEnum ret;
+
+    *local_name = JS_ATOM_NULL;
+    ret = js_resolve_export(ctx, &res_m, &res_me, m, export_name);
+    if (ret != JS_RESOLVE_RES_FOUND)
+        return JS_ATOM_NULL;
+    if (res_me->export_type != JS_EXPORT_TYPE_LOCAL &&
+        res_me->local_name == JS_ATOM__star_) {
+        res_m = res_m->req_module_entries[res_me->u.req_module_idx].module;
+        *local_name = JS_DupAtom(ctx, JS_ATOM__star_);
+    } else {
+        *local_name = JS_DupAtom(ctx, res_me->local_name);
+    }
+    return JS_DupAtom(ctx, res_m->module_name);
+}
+
 /* Bintana patch: see quickjs.h.  After the last pass every name the scope
    analysis could not bind to a local, an argument or a closure variable is an
    opcode carrying its atom -- the global lookups -- so the free names of a

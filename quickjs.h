@@ -1444,6 +1444,13 @@ typedef void JSFreeNameHandler(JSContext *ctx, JSAtom name, int line,
                                void *opaque);
 JS_EXTERN void JS_EnumFreeNames(JSContext *ctx, JSValueConst compiled,
                                 JSFreeNameHandler *cb, void *opaque);
+/* Bintana patch: where an exported name of a linked module is declared -- the
+   name of the module whose own binding it is, with that binding's local name in
+   `*local_name` -- through re-exports and `export *`.  Two exports that answer
+   the same pair are one binding.  JS_ATOM_NULL when the name does not resolve;
+   both atoms are the caller's to free. */
+JS_EXTERN JSAtom JS_GetExportOrigin(JSContext *ctx, JSModuleDef *m,
+                                    JSAtom export_name, JSAtom *local_name);
 
 /* associate a JSValue to a C module */
 JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);

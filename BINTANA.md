@@ -2,7 +2,7 @@
 
 A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the eighteen
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Eighteen patches, one commit each (the fourth has a second), plus this file, on top of `v0.17.0`, and one upstream fix
+**Eighteen patches, one commit each (the fourth has three more), plus this file, on top of `v0.17.0`, and one upstream fix
 taken early (below).** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
@@ -13,7 +13,7 @@ those assertions are the only thing that would say so.
 | 1 | `Add an arithmetic hook for embedder classes` | `JS_SetArithHandler`, consulted by the four arithmetic slow paths before they reach `ToPrimitive` -- what gives Bintana's `Decimal` its operators. |
 | 2 | `Parse JSON numbers with js_atod, not strtod` | `json_parse_number` reads the number itself rather than the C locale's decimal separator, which `setlocale` made a decimal comma. |
 | 3 | `Name the property a non-extensible refusal was about` | `JS_ThrowTypeErrorNotExtensible`, so a refused assignment says which name. |
-| 4 | `Add a per-opcode debugger hook and frame readers` | `JS_SetDebugHandler`, the `JS_Debug*` readers, and `this_obj`/`debug_line` on `JSStackFrame`. **A second commit** (`Show a module's lines and a frame's closure variables to the debugger`) teaches the readers modules: `JS_DebugLines` reads a module record as its body, and `JS_DebugLocals`/`JS_DebugEval` read a function's closure variables through `var_refs` after its own names -- which is what a module's private top-level names are to the function using them. |
+| 4 | `Add a per-opcode debugger hook and frame readers` | `JS_SetDebugHandler`, the `JS_Debug*` readers, and `this_obj`/`debug_line` on `JSStackFrame`. **A second commit** (`Show a module's lines and a frame's closure variables to the debugger`) teaches the readers modules: `JS_DebugLines` reads a module record as its body, and `JS_DebugLocals`/`JS_DebugEval` read a function's closure variables through `var_refs` after its own names -- which is what a module's private top-level names are to the function using them. **A third** (`Take the debugger's check out of the dispatch loop`) reaches the hook through a second dispatch table chosen once per call, so a run with no handler has no check before any opcode; **a fourth** (`Decode pc2line once per entry under the debugger`) keeps on the frame the pcs of the pc2line entry it is in, so `JS_DebugPosition` decodes the table only when the pc leaves it. |
 | 5 | `Refuse async where it is written` | Two parser guards: the runtime installs no `Promise`, and an async closure's object would never be released. |
 | 6 | `Report a compile's declarations to the embedder` | `JS_SetSymbolHandler`: classes, methods and top-level functions with their line, for an editor's outline. |
 | 7 | `Report a class's base class to the embedder` | A `supertype` on every reported class: the name in an `extends` clause. Without it a class declared in a file the host never runs cannot say what it inherits, and an inherited surface is most of what a control has. A bare identifier only -- an `extends` that is a call or a member expression reports none, checked against the opcode the heritage compiled to. |
@@ -54,8 +54,9 @@ does happen, these are the places to read first:
 - `build_backtrace` and the reader block written under it -- the patch inserts
   before the function's original closing brace and that brace ends up closing
   the last new function.
-- `JS_CallInternal`: the `this_obj` writes and the `SWITCH` /
-  `BTA_DEBUG_STEP` dispatch macros.
+- `JS_CallInternal`: the `this_obj` writes, the `SWITCH` / `BTA_DEBUG_STEP`
+  dispatch macros, `debug_table` beside `dispatch_table`, and the
+  `case_debug_step` trampoline just before `CASE(OP_invalid)`.
 - the parser: `js_parse_function_decl2` (patches 5 and 6), `js_parse_class`,
   `set_object_name`, `json_parse_number` (patch 2).
 

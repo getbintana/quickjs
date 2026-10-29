@@ -21860,8 +21860,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #if DIRECT_DISPATCH
         case_debug_step:
             /* Bintana patch: `debug_table`'s one entry.  The pc is already past
-               the opcode byte, which is where the opcode's operands start. */
-            rt->debug_handler(ctx, pc - 1, rt->debug_opaque);
+               the opcode byte, which is where the opcode's operands start.
+               Inside the pc2line entry this frame was last found in, the
+               handler would only be told what JS_DebugPosition already
+               knows -- the same line -- so it is not called at all: that is
+               nearly every opcode, and a C call apiece was what a program
+               under an attached debugger paid. */
+            {
+                uint32_t off = (uint32_t)(pc - 1 - b->byte_code_buf);
+
+                if (off < sf->debug_pc_lo || off >= sf->debug_pc_hi)
+                    rt->debug_handler(ctx, pc - 1, rt->debug_opaque);
+            }
             goto *dispatch_table[opcode];
 #endif
         CASE(OP_invalid):

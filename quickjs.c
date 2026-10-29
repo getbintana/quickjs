@@ -18919,13 +18919,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DUMP_BYTECODE_OR_DONT(pc)
 #endif
 
-/* Bintana patch: the debugger looks before every opcode.  With none installed
-   this is one predictable branch on a field already in cache; what it costs when
-   nothing is attached is measured in docs/plans/debug-plan.md. */
+/* Bintana patch: the debugger looks before every opcode.  With computed goto the
+   loop jumps through one of two tables, chosen once per call: `dispatch_table`
+   when no handler is installed, which has no check in it at all, and
+   `debug_table`, whose every entry is the trampoline `case_debug_step` -- call
+   the handler with the pc of the opcode, then jump where `dispatch_table` would
+   have.  Choosing at entry is enough because the embedder installs the handler
+   before any of its code runs and never removes it, so it is a constant of the
+   process and no frame can start under one table and need the other.  **An
+   attach to a program already running breaks that**: the table then has to be
+   read again at a call and on a backward jump.  The `switch` spelling keeps the
+   branch.  What each costs is measured in Bintana's
+   docs/plans/interpreter-plan.md. */
+#if !DIRECT_DISPATCH
 #define BTA_DEBUG_STEP(pc) \
     if (unlikely(rt->debug_handler)) rt->debug_handler(ctx, pc, rt->debug_opaque);
-
-#if !DIRECT_DISPATCH
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) BTA_DEBUG_STEP(pc) switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
@@ -18937,7 +18945,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ BTA_DEBUG_STEP(pc) goto *dispatch_table[opcode = *pc++]; });
+    __extension__ static const void * const debug_table[256] = {
+        [ 0 ... 255 ] = &&case_debug_step
+    };
+    const void * const *table = rt->debug_handler ? debug_table : dispatch_table;
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
@@ -21781,6 +21793,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = JS_FALSE;
             BREAK;
+#if DIRECT_DISPATCH
+        case_debug_step:
+            /* Bintana patch: `debug_table`'s one entry.  The pc is already past
+               the opcode byte, which is where the opcode's operands start. */
+            rt->debug_handler(ctx, pc - 1, rt->debug_opaque);
+            goto *dispatch_table[opcode];
+#endif
         CASE(OP_invalid):
         DEFAULT:
             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",

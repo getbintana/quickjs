@@ -456,6 +456,10 @@ typedef struct JSStackFrame {
        back on the line that made it, which would stop twice. The memory belongs
        to the frame because the question does. Zero until asked. */
     int debug_line;
+    /* Bintana patch: the pcs of the pc2line entry `debug_line` was read from,
+       [lo, hi), so the next opcode inside it does not decode the table again.
+       Empty (hi 0) until asked. */
+    uint32_t debug_pc_lo, debug_pc_hi;
     uint16_t var_ref_count; /* number of var refs */
     uint16_t arg_count;
     bool is_strict_mode;
@@ -8607,21 +8611,80 @@ static JSStackFrame *bta_frame_at(JSRuntime *rt, int index)
 /*
  * The running frame's file and line, and nothing else built.
  *
- * This is what runs per opcode while a breakpoint is armed, so it allocates
+ * This is what runs per opcode while a debugger is installed, so it allocates
  * nothing and returns the filename as an atom: comparing atoms is comparing
  * integers, and the caller only needs a string once it has decided to stop.
+ *
+ * And it decodes pc2line only when the pc leaves the entry it was last found
+ * in: `find_line_num` reads the table from the start of the function every
+ * time, which per opcode made a loop under a debugger 30 times slower than
+ * without one.  `bta_line_range` is the same decoder, answering the pcs the
+ * entry covers as well; the frame keeps them beside `debug_line`.
  */
+static int bta_line_range(JSFunctionBytecode *b, uint32_t pc_value,
+                          uint32_t *lo, uint32_t *hi)
+{
+    const uint8_t *p = b->pc2line_buf, *p_end;
+    uint32_t       pc = 0, start = 0, val;
+    int            line_num = b->line_num, new_line_num, ret;
+    int32_t        v;
+    unsigned int   op;
+
+    *lo = 0;
+    *hi = 0;                        /* empty: the next opcode decodes again */
+    if (!p)
+        return line_num;
+    p_end = p + b->pc2line_len;
+    while (p < p_end) {
+        op = *p++;
+        if (op == 0) {
+            ret = get_leb128(&val, p, p_end);
+            if (ret < 0)
+                return b->line_num;
+            pc += val;
+            p += ret;
+            ret = get_sleb128(&v, p, p_end);
+            if (ret < 0)
+                return b->line_num;
+            p += ret;
+            new_line_num = line_num + v;
+        } else {
+            op -= PC2LINE_OP_FIRST;
+            pc += (op / PC2LINE_RANGE);
+            new_line_num = line_num + (op % PC2LINE_RANGE) + PC2LINE_BASE;
+        }
+        ret = get_sleb128(&v, p, p_end);    /* the column, not wanted here */
+        if (ret < 0)
+            return b->line_num;
+        p += ret;
+        if (pc_value < pc) {
+            *lo = start;
+            *hi = pc;
+            return line_num;
+        }
+        line_num = new_line_num;
+        start = pc;
+    }
+    *lo = start;
+    *hi = UINT32_MAX;
+    return line_num;
+}
+
 bool JS_DebugPosition(JSContext *ctx, const uint8_t *pc, JSAtom *file, int *line)
 {
     JSStackFrame       *sf = ctx->rt->current_stack_frame;
     JSFunctionBytecode *b  = bta_frame_bytecode(sf);
-    int                 column;
+    uint32_t            off;
     int                 at;
 
     if (!b || !pc)
         return false;
 
-    at = find_line_num(ctx, b, (uint32_t)(pc - b->byte_code_buf), &column);
+    off = (uint32_t)(pc - b->byte_code_buf);
+    if (off >= sf->debug_pc_lo && off < sf->debug_pc_hi)
+        return false;               /* inside the entry already decoded */
+
+    at = bta_line_range(b, off, &sf->debug_pc_lo, &sf->debug_pc_hi);
     if (at == -1 || at == sf->debug_line)
         return false;               /* the same line as the opcode before it */
 
@@ -19015,6 +19078,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_func = unsafe_unconst(func_obj);
     sf->this_obj = unsafe_unconst(this_obj);   /* Bintana patch */
     sf->debug_line = 0;                        /* Bintana patch */
+    sf->debug_pc_hi = 0;                       /* Bintana patch */
     var_refs = p->u.func.var_refs;
 
     local_buf = alloca(alloca_size);

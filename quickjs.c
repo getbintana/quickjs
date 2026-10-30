@@ -8618,8 +8618,9 @@ static JSStackFrame *bta_frame_at(JSRuntime *rt, int index)
  * And it decodes pc2line only when the pc leaves the entry it was last found
  * in: `find_line_num` reads the table from the start of the function every
  * time, which per opcode made a loop under a debugger 30 times slower than
- * without one.  `bta_line_range` is the same decoder, answering the pcs the
- * entry covers as well; the frame keeps them beside `debug_line`.
+ * without one.  `bta_line_range` is the same decoder, answering as well the pcs
+ * of the whole run of entries on that line -- QuickJS writes one per
+ * expression, for the column -- and the frame keeps them beside `debug_line`.
  */
 static int bta_line_range(JSFunctionBytecode *b, uint32_t pc_value,
                           uint32_t *lo, uint32_t *hi)
@@ -8629,6 +8630,7 @@ static int bta_line_range(JSFunctionBytecode *b, uint32_t pc_value,
     int            line_num = b->line_num, new_line_num, ret;
     int32_t        v;
     unsigned int   op;
+    bool           found = false;
 
     *lo = 0;
     *hi = 0;                        /* empty: the next opcode decodes again */
@@ -8657,13 +8659,19 @@ static int bta_line_range(JSFunctionBytecode *b, uint32_t pc_value,
         if (ret < 0)
             return b->line_num;
         p += ret;
-        if (pc_value < pc) {
-            *lo = start;
-            *hi = pc;
-            return line_num;
+        if (!found && pc_value < pc)
+            found = true;
+        if (found) {
+            if (new_line_num != line_num) {
+                *lo = start;
+                *hi = pc;
+                return line_num;
+            }
+            continue;               /* the same line goes on: widen */
         }
+        if (new_line_num != line_num)
+            start = pc;
         line_num = new_line_num;
-        start = pc;
     }
     *lo = start;
     *hi = UINT32_MAX;

@@ -916,6 +916,11 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+    /* Bintana patch: the debugger's line table -- one run per line, in pc
+       order -- decoded from pc2line the first time a debugger asks and kept
+       until the function goes. NULL in a run with no debugger. */
+    struct BtaLineRun *bta_lines;
+    int bta_line_count;
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -8611,43 +8616,55 @@ static JSStackFrame *bta_frame_at(JSRuntime *rt, int index)
 /*
  * The running frame's file and line, and nothing else built.
  *
- * This is what runs per opcode while a debugger is installed, so it allocates
- * nothing and returns the filename as an atom: comparing atoms is comparing
- * integers, and the caller only needs a string once it has decided to stop.
+ * This is what runs per opcode while a debugger is installed, so it returns
+ * the filename as an atom: comparing atoms is comparing integers, and the
+ * caller only needs a string once it has decided to stop.
  *
- * And it decodes pc2line only when the pc leaves the entry it was last found
- * in: `find_line_num` reads the table from the start of the function every
- * time, which per opcode made a loop under a debugger 30 times slower than
- * without one.  `bta_line_range` is the same decoder, answering as well the pcs
- * of the whole run of entries on that line -- QuickJS writes one per
- * expression, for the column -- and the frame keeps them beside `debug_line`.
+ * The line comes from a table kept on the function: `find_line_num` reads
+ * pc2line from the start of the function every time, which per opcode made a
+ * loop under a debugger 30 times slower than without one, and per line still
+ * cost a walk of the function. `bta_line_table` decodes it once into runs of
+ * one line each -- QuickJS writes an entry per expression, for the column, so
+ * a line is several -- and a lookup is a binary search answering the run's
+ * pcs as well, which the frame keeps beside `debug_line`.
  */
-static int bta_line_range(JSFunctionBytecode *b, uint32_t pc_value,
-                          uint32_t *lo, uint32_t *hi)
+typedef struct BtaLineRun {
+    uint32_t pc;                    /* where the run starts */
+    int      line;
+} BtaLineRun;
+
+static bool bta_line_table(JSRuntime *rt, JSFunctionBytecode *b)
 {
     const uint8_t *p = b->pc2line_buf, *p_end;
-    uint32_t       pc = 0, start = 0, val;
-    int            line_num = b->line_num, new_line_num, ret;
+    uint32_t       pc = 0, val;
+    int            line_num = b->line_num, new_line_num, ret, n = 1, cap = 16;
     int32_t        v;
     unsigned int   op;
-    bool           found = false;
+    BtaLineRun    *runs;
 
-    *lo = 0;
-    *hi = 0;                        /* empty: the next opcode decodes again */
+    if (b->bta_lines)
+        return true;
     if (!p)
-        return line_num;
+        return false;
+
+    runs = js_malloc_rt(rt, cap * sizeof(*runs));
+    if (!runs)
+        return false;
+    runs[0].pc   = 0;
+    runs[0].line = line_num;
+
     p_end = p + b->pc2line_len;
     while (p < p_end) {
         op = *p++;
         if (op == 0) {
             ret = get_leb128(&val, p, p_end);
             if (ret < 0)
-                return b->line_num;
+                goto fail;
             pc += val;
             p += ret;
             ret = get_sleb128(&v, p, p_end);
             if (ret < 0)
-                return b->line_num;
+                goto fail;
             p += ret;
             new_line_num = line_num + v;
         } else {
@@ -8657,25 +8674,59 @@ static int bta_line_range(JSFunctionBytecode *b, uint32_t pc_value,
         }
         ret = get_sleb128(&v, p, p_end);    /* the column, not wanted here */
         if (ret < 0)
-            return b->line_num;
+            goto fail;
         p += ret;
-        if (!found && pc_value < pc)
-            found = true;
-        if (found) {
-            if (new_line_num != line_num) {
-                *lo = start;
-                *hi = pc;
-                return line_num;
+
+        if (new_line_num != line_num) {
+            if (runs[n - 1].pc == pc) {     /* two entries at one pc: the last wins */
+                runs[n - 1].line = new_line_num;
+            } else {
+                if (n == cap) {
+                    BtaLineRun *more = js_realloc_rt(rt, runs, 2 * cap * sizeof(*runs));
+                    if (!more)
+                        goto fail;
+                    runs = more;
+                    cap *= 2;
+                }
+                runs[n].pc   = pc;
+                runs[n].line = new_line_num;
+                n++;
             }
-            continue;               /* the same line goes on: widen */
         }
-        if (new_line_num != line_num)
-            start = pc;
         line_num = new_line_num;
     }
-    *lo = start;
-    *hi = UINT32_MAX;
-    return line_num;
+    b->bta_lines      = runs;
+    b->bta_line_count = n;
+    return true;
+
+ fail:
+    js_free_rt(rt, runs);
+    return false;
+}
+
+static int bta_line_range(JSRuntime *rt, JSFunctionBytecode *b,
+                          uint32_t pc_value, uint32_t *lo, uint32_t *hi)
+{
+    int first = 0, last;
+
+    *lo = 0;
+    *hi = 0;                        /* empty: the next opcode asks again */
+    if (!bta_line_table(rt, b))
+        return b->line_num;
+
+    /* The last run that starts at or before the pc. */
+    last = b->bta_line_count - 1;
+    while (first < last) {
+        int mid = (first + last + 1) / 2;
+
+        if (b->bta_lines[mid].pc <= pc_value)
+            first = mid;
+        else
+            last = mid - 1;
+    }
+    *lo = b->bta_lines[first].pc;
+    *hi = first + 1 < b->bta_line_count ? b->bta_lines[first + 1].pc : UINT32_MAX;
+    return b->bta_lines[first].line;
 }
 
 bool JS_DebugPosition(JSContext *ctx, const uint8_t *pc, JSAtom *file, int *line)
@@ -8690,9 +8741,9 @@ bool JS_DebugPosition(JSContext *ctx, const uint8_t *pc, JSAtom *file, int *line
 
     off = (uint32_t)(pc - b->byte_code_buf);
     if (off >= sf->debug_pc_lo && off < sf->debug_pc_hi)
-        return false;               /* inside the entry already decoded */
+        return false;               /* inside the line already found */
 
-    at = bta_line_range(b, off, &sf->debug_pc_lo, &sf->debug_pc_hi);
+    at = bta_line_range(ctx->rt, b, off, &sf->debug_pc_lo, &sf->debug_pc_hi);
     if (at == -1 || at == sf->debug_line)
         return false;               /* the same line as the opcode before it */
 
@@ -38922,6 +38973,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+    js_free_rt(rt, b->bta_lines);             /* Bintana patch */
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && JS_REF_COUNT(b) != 0) {

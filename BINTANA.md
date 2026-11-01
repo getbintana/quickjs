@@ -2,11 +2,14 @@
 
 A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the eighteen
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Eighteen patches, one commit each (the fourth has six more), plus this file, on top of `v0.17.0`, and one upstream fix
-taken early (below).** Every patch is marked
+**Eighteen patches, one commit each (the fourth has six more), plus this file, on top of `v0.18.0`.** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
 those assertions are the only thing that would say so.
+
+`v0.18.0` is also the release that contains the GCC 14+ performance fix
+(`2f0aa72`) this branch used to carry as a cherry-pick; the rebase onto it
+dropped the cherry-pick, as designed.
 
 | # | Commit | What it adds |
 |---|---|---|
@@ -29,25 +32,21 @@ those assertions are the only thing that would say so.
 | 17 | `Say which module an export's binding belongs to` | `JS_GetExportOrigin`: for an exported name of a linked module, the module whose own binding it is and that binding's local name, through `export { x } from`, `export *` and `export * as ns` -- `js_resolve_export`'s answer, made public. Bintana tells one binding handed out by several files from two bindings by it; comparing values made two `export let count = 0` one. |
 | 18 | `Report the names a module declares at its own top level` | `JS_EnumModuleDeclarations`: the closure variables a module body creates itself (`JS_CLOSURE_MODULE_DECL`) -- its top-level declarations, exported or not, imports and `*default*` left out. And `JS_EnumFreeNamesFlags`, patch 16's walk with `JS_FREE_NAMES_SKIP_TYPEOF`, which leaves a `typeof` out. Bintana refuses at load a file that uses a name another module keeps to itself, which is otherwise a ReferenceError on the day the line runs. |
 
-## Taken from upstream before a release
-
-| Upstream | Why it could not wait |
-|---|---|
-| `2f0aa72` *Port bellard/quickjs@10c81b1 to fix GCC 14+ performance regression* | `JS_MKVAL` wrote half of a 16-byte `JSValue`, and GCC 14 and later turn every `js_int32`/`js_bool` inlined into `JS_CallInternal` into a read-modify-write through the stack. Measured on GCC 16, Release, against the tree without it: a tight integer loop **1650 -> 580 ms**, property reads **1092 -> 570 ms**. It touches `quickjs.h` only and none of the patches above. |
-
-A cherry-pick (`-x`, so it names its upstream commit) and not a patch: the
-release that contains it makes it disappear from this branch at the next
-rebase, which is the whole of what to do about it.
-
 ## Rebasing on a new upstream release
 
     git remote add upstream https://github.com/quickjs-ng/quickjs.git   # once
     git fetch upstream --tags
-    git rebase v0.18.0 bintana
+    git rebase v0.19.0 bintana
 
-The series is small -- about 950 lines across `quickjs.c` and `quickjs.h` --
-and between v0.16.1 and v0.17.0 it applied with offsets only. When a conflict
-does happen, these are the places to read first:
+The series is small -- about 2,100 lines across `quickjs.c` and `quickjs.h` --
+and between v0.16.1 and v0.17.0 it applied with offsets only. **v0.18.0 needed
+two resolutions in `quickjs.c`**, and one of them is why the result has to be
+read and not only built: upstream reverted the computed-property
+evaluation-order block (`0db3949`, the spec changed), patch 10's hunk sits
+beside it, and taking "both sides" resurrects the block. It compiles, and then
+the prelude fails with `InternalError: stack underflow (op=17, pc=0)` and the
+runtime comes up with no `rad.js` at all. Keep only the Bintana block. When a
+conflict does happen, these are the places to read first:
 
 - `JSRuntime`'s field block and `JSStackFrame`'s: several patches add members
   beside the same neighbors.
@@ -58,10 +57,16 @@ does happen, these are the places to read first:
   dispatch macros, `debug_table` beside `dispatch_table`, and the
   `case_debug_step` trampoline just before `CASE(OP_invalid)`.
 - the parser: `js_parse_function_decl2` (patches 5 and 6), `js_parse_class`,
-  `set_object_name`, `json_parse_number` (patch 2).
+  `js_parse_assign_expr2` (patch 10), `set_object_name`, `json_parse_number`
+  (patch 2).
 
-After a rebase, compile Bintana against the tip and run it rather than trusting
-the build:
+After a rebase, compile the two preludes with the vendored `qjs` before building
+Bintana -- a broken bytecode emitter shows here first, and names the file:
+
+    qjs -C runtime/js/rad.js
+    qjs -C runtime/js/forms.js
+
+then compile Bintana against the tip and run it rather than trusting the build:
 
     ./tests/run.sh widgets
 

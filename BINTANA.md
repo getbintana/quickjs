@@ -1,8 +1,8 @@
 # bintana
 
-A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the nineteen
+A fork of [quickjs-ng](https://github.com/quickjs-ng/quickjs) carrying the twenty
 patches the [Bintana](https://github.com/getbintana/bintana) runtime needs.
-**Nineteen patches, one commit each (the fourth has six more), plus this file, on top of `v0.18.0`.** Every patch is marked
+**Twenty patches, one commit each (the fourth has six more), plus this file, on top of `v0.18.0`.** Every patch is marked
 in the source with `Bintana patch`, and Bintana's test suite asserts that each
 one still works -- a patch an upstream change drops does not fail to build, so
 those assertions are the only thing that would say so.
@@ -32,6 +32,7 @@ dropped the cherry-pick, as designed.
 | 17 | `Say which module an export's binding belongs to` | `JS_GetExportOrigin`: for an exported name of a linked module, the module whose own binding it is and that binding's local name, through `export { x } from`, `export *` and `export * as ns` -- `js_resolve_export`'s answer, made public. Bintana tells one binding handed out by several files from two bindings by it; comparing values made two `export let count = 0` one. |
 | 18 | `Report the names a module declares at its own top level` | `JS_EnumModuleDeclarations`: the closure variables a module body creates itself (`JS_CLOSURE_MODULE_DECL`) -- its top-level declarations, exported or not, imports and `*default*` left out. And `JS_EnumFreeNamesFlags`, patch 16's walk with `JS_FREE_NAMES_SKIP_TYPEOF`, which leaves a `typeof` out. Bintana refuses at load a file that uses a name another module keeps to itself, which is otherwise a ReferenceError on the day the line runs. |
 | 19 | `A reference error carries the replacement hint` | `JS_SetReferenceHintHandler`: the host writes the sentence a taken-away name should carry (`": use Timer.After(delay, tick)"`, or `", and nothing here replaces it"`) and `JS_ThrowReferenceErrorNotDefined` puts it in the message. A caught error never reaches the host's reporting, so the hint that was only on the terminal is now in `e.message` too. |
+| 20 | `Report a class field to the embedder` | `JS_SYMBOL_FIELD`: a public instance field (`total = 0;`) is reported with its class in `parent`, at its line and with its documentation. A private field is not reached as `this.name` and a static one belongs to the constructor, so neither is this kind. It is what lets an editor rename `this.total` and the field it means. |
 
 ## Rebasing on a new upstream release
 

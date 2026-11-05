@@ -733,6 +733,11 @@ typedef enum {
      * so the handler's shape does not move. */
     JS_SYMBOL_EXPORT,
     JS_SYMBOL_IMPORT,
+    /* Bintana patch: a public instance field of a class -- `total = 0;` --
+     * which is a member an editor lists and a rename can move.  A private
+     * field is not reached as `this.name`, and a static one belongs to the
+     * constructor and not to the instance, so neither is this kind. */
+    JS_SYMBOL_FIELD,
 } JSSymbolKind;
 /* `supertype` is the name in an `extends` clause and is empty for everything
  * except a class, for a class that declares no `extends`, and for a class whose

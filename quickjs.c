@@ -27249,6 +27249,17 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 goto fail;
             }
 
+            /* Bintana patch: a public instance field is a member of the class,
+             * at its own line and with its documentation.  A private field is
+             * not reached as `this.name`, and a static one is the class's and
+             * not the instance's, so neither is reported.  A computed name has
+             * no name to report. */
+            if (class_name != JS_ATOM_NULL && !is_private && !is_static &&
+                name != JS_ATOM_NULL)
+                js_report_symbol_full(s, JS_SYMBOL_FIELD, name, class_name,
+                                      JS_ATOM_NULL, NULL, member_line, 0,
+                                      member_doc);
+
             if (is_private) {
                 if (find_private_class_field(ctx, fd, name,
                                              fd->scope_level) >= 0) {

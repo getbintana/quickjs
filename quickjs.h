@@ -598,6 +598,23 @@ typedef enum {
 typedef int JSArithHandler(JSContext *ctx, JSValue *sp, JSArithOp op);
 JS_EXTERN void JS_SetArithHandler(JSRuntime *rt, JSArithHandler *handler);
 
+/* Bintana patch: the sentence a `ReferenceError` carries for a name the
+   language took away.
+
+   The runtime knows the replacement table; the engine is where the error is
+   built, and a caught error never reaches the runtime's reporting. The handler
+   writes the suffix after `<name> is not defined` into `buf` -- `": use ..."`
+   or `", and nothing here replaces it"` -- and answers true. With no handler,
+   or a name it does not know, the engine's sentence is unchanged.
+
+   It is a runtime-level callback, like JS_SetArithHandler, and is called only
+   when the engine raises this one error. */
+typedef bool JSReferenceHintHandler(JSContext *ctx, const char *name,
+                                    char *buf, size_t len, void *opaque);
+JS_EXTERN void JS_SetReferenceHintHandler(JSRuntime *rt,
+                                          JSReferenceHintHandler *cb,
+                                          void *opaque);
+
 /* Bintana patch: what a debugger needs, and nothing it does not.
 
    The handler is called before each opcode with the pc about to run -- which is

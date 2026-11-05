@@ -387,6 +387,9 @@ struct JSRuntime {
     void *interrupt_opaque;
     /* Bintana patch: see JS_SetArithHandler in quickjs.h. */
     JSArithHandler *arith_handler;
+    /* Bintana patch: see JS_SetReferenceHintHandler in quickjs.h. */
+    JSReferenceHintHandler *reference_hint_handler;
+    void *reference_hint_opaque;
     /* Bintana patch: see JS_SetSymbolHandler in quickjs.h.  Installed for one
      * compile and NULL the rest of the time, so the parser's test is one load
      * per declaration. */
@@ -2510,6 +2513,14 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 void JS_SetArithHandler(JSRuntime *rt, JSArithHandler *handler)
 {
     rt->arith_handler = handler;
+}
+
+/* Bintana patch: see JS_SetReferenceHintHandler in quickjs.h. */
+void JS_SetReferenceHintHandler(JSRuntime *rt, JSReferenceHintHandler *cb,
+                                void *opaque)
+{
+    rt->reference_hint_handler = cb;
+    rt->reference_hint_opaque  = opaque;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
@@ -9524,8 +9535,18 @@ static JSValue JS_ThrowTypeErrorNotASymbol(JSContext *ctx)
 static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
-    return JS_ThrowReferenceError(ctx, "%s is not defined",
-                                  JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+    const char *s = JS_AtomGetStr(ctx, buf, sizeof(buf), name);
+
+    /* Bintana patch: the replacement sentence, when the host has one, belongs
+     * in the message -- a caught error is read by whoever caught it and never
+     * reaches the host's reporting. */
+    if (ctx->rt->reference_hint_handler) {
+        char hint[512];
+        if (ctx->rt->reference_hint_handler(ctx, s, hint, sizeof(hint),
+                                            ctx->rt->reference_hint_opaque))
+            return JS_ThrowReferenceError(ctx, "%s is not defined%s", s, hint);
+    }
+    return JS_ThrowReferenceError(ctx, "%s is not defined", s);
 }
 
 static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
